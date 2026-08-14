@@ -50,7 +50,7 @@ axA.set_ylabel('Attitude RMSE (deg)')
 axA.set_title('Clean vibration: identical inputs')
 axA.set_ylim(0, None)
 axA.annotate('ring tracks the CF with a\nsmall substrate overhead',
-             xy=(amps[-2], d['envelope'][-2]['ring_anch']), xytext=(0.06, 0.70),
+             xy=(amps[-2], d['envelope'][-2]['ring_anch']), xytext=(0.30, 0.66),
              textcoords='axes fraction', fontsize=8, color=C_RING,
              arrowprops=dict(arrowstyle='->', color=figstyle.C_MUTED, lw=0.9,
                              connectionstyle='arc3,rad=0.15'))

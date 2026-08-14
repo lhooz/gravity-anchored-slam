@@ -119,7 +119,7 @@ axB.annotate('path-integrates\nvibration $\\rightarrow$ drifts',
              arrowprops=dict(arrowstyle='->', color=figstyle.C_IMU, lw=0.8,
                              connectionstyle='arc3,rad=0.25'))
 axB.annotate('anchored ring tracks the raw CF',
-             xy=(amp[3], an[3]), xytext=(0.06, 0.10), textcoords='axes fraction',
+             xy=(amp[4], an[4]), xytext=(0.06, 0.10), textcoords='axes fraction',
              fontsize=7.2, color=figstyle.C_ANCH, ha='left',
              arrowprops=dict(arrowstyle='->', color=figstyle.C_ANCH, lw=0.8))
 axB.legend(loc='upper left', bbox_to_anchor=(0.02, 1.0), fontsize=7.4, handlelength=1.4,
