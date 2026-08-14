@@ -1,5 +1,7 @@
 # Gravity-Anchored Neuromorphic Navigation: Sub-Milliwatt Attitude Stabilization and Loop Closure for Insect-Scale Flyers
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21927204.svg)](https://doi.org/10.5281/zenodo.21927204)
+
 Code and figure-reproduction scripts for the paper:
 
 > **Gravity-Anchored Neuromorphic Navigation: Sub-Milliwatt Attitude Stabilization and Loop Closure for Insect-Scale Flyers.** Hao Li, Yanlai Zhang, Runqi Chai, and Jianghao Wu. Manuscript under review, 2026.
@@ -148,7 +150,7 @@ The committed `*.json` / `*.npz` files hold the exact values reported in the pap
 }
 ```
 
-A citable **Zenodo DOI** for this code will be minted from a tagged release and added here.
+This code is archived on Zenodo: concept DOI [10.5281/zenodo.21927204](https://doi.org/10.5281/zenodo.21927204) (always resolves to the latest version; v1.0 is [10.5281/zenodo.21927205](https://doi.org/10.5281/zenodo.21927205)).
 
 ## License
 
