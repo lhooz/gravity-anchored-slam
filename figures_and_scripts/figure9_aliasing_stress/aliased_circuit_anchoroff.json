@@ -1,0 +1,318 @@
+{
+  "results": [
+    {
+      "seed": 42,
+      "n_steps": 2000,
+      "n_loop_closures": 265,
+      "n_nodes": 296,
+      "n_lc_true_pos": 265,
+      "lc_precision": 1.0,
+      "lc_audit": {
+        "gt_pairs": 10323,
+        "hdc_cand": 23622,
+        "hdc_true": 8565,
+        "hdc_geom_pass": 3488
+      },
+      "ate_imu": 0.15364998579025269,
+      "ate_ol": 0.12410522335983526,
+      "ate_cl_off": 0.12410522335983526,
+      "ate_cl_on": 0.02165197200788537,
+      "final_cl_off": 0.34583582036369787,
+      "final_cl_on": 0.06501676193321085
+    },
+    {
+      "seed": 153,
+      "n_steps": 2000,
+      "n_loop_closures": 256,
+      "n_nodes": 287,
+      "n_lc_true_pos": 256,
+      "lc_precision": 1.0,
+      "lc_audit": {
+        "gt_pairs": 10019,
+        "hdc_cand": 7551,
+        "hdc_true": 6340,
+        "hdc_geom_pass": 1330
+      },
+      "ate_imu": 0.2514655590057373,
+      "ate_ol": 0.24196836789108817,
+      "ate_cl_off": 0.24196836789108817,
+      "ate_cl_on": 0.09219692172077436,
+      "final_cl_off": 0.37807281133118853,
+      "final_cl_on": 0.09321122830833156
+    },
+    {
+      "seed": 264,
+      "n_steps": 2000,
+      "n_loop_closures": 219,
+      "n_nodes": 250,
+      "n_lc_true_pos": 216,
+      "lc_precision": 0.9863013698630136,
+      "lc_audit": {
+        "gt_pairs": 6124,
+        "hdc_cand": 7595,
+        "hdc_true": 4776,
+        "hdc_geom_pass": 1017
+      },
+      "ate_imu": 0.27784302830696106,
+      "ate_ol": 0.3333602524661616,
+      "ate_cl_off": 0.3333602524661616,
+      "ate_cl_on": 0.1910579885021594,
+      "final_cl_off": 0.5635067959962317,
+      "final_cl_on": 0.3270913117059974
+    },
+    {
+      "seed": 375,
+      "n_steps": 2000,
+      "n_loop_closures": 263,
+      "n_nodes": 294,
+      "n_lc_true_pos": 263,
+      "lc_precision": 1.0,
+      "lc_audit": {
+        "gt_pairs": 10895,
+        "hdc_cand": 9636,
+        "hdc_true": 6741,
+        "hdc_geom_pass": 3022
+      },
+      "ate_imu": 0.12214739620685577,
+      "ate_ol": 0.0859047367501907,
+      "ate_cl_off": 0.0859047367501907,
+      "ate_cl_on": 0.03551460696328397,
+      "final_cl_off": 0.08160289917614853,
+      "final_cl_on": 0.05485019243859234
+    },
+    {
+      "seed": 486,
+      "n_steps": 2000,
+      "n_loop_closures": 222,
+      "n_nodes": 257,
+      "n_lc_true_pos": 221,
+      "lc_precision": 0.9954954954954955,
+      "lc_audit": {
+        "gt_pairs": 7581,
+        "hdc_cand": 4763,
+        "hdc_true": 4673,
+        "hdc_geom_pass": 699
+      },
+      "ate_imu": 0.2292713075876236,
+      "ate_ol": 0.2680168844887204,
+      "ate_cl_off": 0.2680168844887204,
+      "ate_cl_on": 0.11014511183584406,
+      "final_cl_off": 0.5669815396010576,
+      "final_cl_on": 0.3495829208934922
+    },
+    {
+      "seed": 597,
+      "n_steps": 2000,
+      "n_loop_closures": 253,
+      "n_nodes": 286,
+      "n_lc_true_pos": 253,
+      "lc_precision": 1.0,
+      "lc_audit": {
+        "gt_pairs": 9602,
+        "hdc_cand": 6946,
+        "hdc_true": 6167,
+        "hdc_geom_pass": 2590
+      },
+      "ate_imu": 0.0691937729716301,
+      "ate_ol": 0.10027033414575845,
+      "ate_cl_off": 0.10027033414575845,
+      "ate_cl_on": 0.03008407469285546,
+      "final_cl_off": 0.18703281599376104,
+      "final_cl_on": 0.05922949256717236
+    },
+    {
+      "seed": 708,
+      "n_steps": 2000,
+      "n_loop_closures": 217,
+      "n_nodes": 255,
+      "n_lc_true_pos": 211,
+      "lc_precision": 0.9723502304147466,
+      "lc_audit": {
+        "gt_pairs": 7077,
+        "hdc_cand": 6456,
+        "hdc_true": 4851,
+        "hdc_geom_pass": 770
+      },
+      "ate_imu": 0.3182830810546875,
+      "ate_ol": 0.35702469923990626,
+      "ate_cl_off": 0.35702469923990626,
+      "ate_cl_on": 0.22228130685484718,
+      "final_cl_off": 0.7273752722969524,
+      "final_cl_on": 0.42188024023427156
+    },
+    {
+      "seed": 819,
+      "n_steps": 2000,
+      "n_loop_closures": 255,
+      "n_nodes": 286,
+      "n_lc_true_pos": 255,
+      "lc_precision": 1.0,
+      "lc_audit": {
+        "gt_pairs": 10063,
+        "hdc_cand": 14570,
+        "hdc_true": 8878,
+        "hdc_geom_pass": 3829
+      },
+      "ate_imu": 0.07859384268522263,
+      "ate_ol": 0.09513210035015358,
+      "ate_cl_off": 0.09513210035015358,
+      "ate_cl_on": 0.04925088169329423,
+      "final_cl_off": 0.24057596426096675,
+      "final_cl_on": 0.07102086233130953
+    },
+    {
+      "seed": 930,
+      "n_steps": 2000,
+      "n_loop_closures": 197,
+      "n_nodes": 234,
+      "n_lc_true_pos": 183,
+      "lc_precision": 0.9289340101522843,
+      "lc_audit": {
+        "gt_pairs": 5533,
+        "hdc_cand": 5948,
+        "hdc_true": 3686,
+        "hdc_geom_pass": 918
+      },
+      "ate_imu": 0.25708553194999695,
+      "ate_ol": 0.3064013797427315,
+      "ate_cl_off": 0.3064013797427315,
+      "ate_cl_on": 0.21923641958862347,
+      "final_cl_off": 0.7087560127986592,
+      "final_cl_on": 0.5455163529839356
+    },
+    {
+      "seed": 1041,
+      "n_steps": 2000,
+      "n_loop_closures": 240,
+      "n_nodes": 274,
+      "n_lc_true_pos": 240,
+      "lc_precision": 1.0,
+      "lc_audit": {
+        "gt_pairs": 7387,
+        "hdc_cand": 9183,
+        "hdc_true": 5448,
+        "hdc_geom_pass": 2738
+      },
+      "ate_imu": 0.08005614578723907,
+      "ate_ol": 0.11598934749414082,
+      "ate_cl_off": 0.11598934749414082,
+      "ate_cl_on": 0.04396600982847837,
+      "final_cl_off": 0.30460655248813384,
+      "final_cl_on": 0.06100770947809114
+    },
+    {
+      "seed": 1152,
+      "n_steps": 2000,
+      "n_loop_closures": 215,
+      "n_nodes": 250,
+      "n_lc_true_pos": 210,
+      "lc_precision": 0.9767441860465116,
+      "lc_audit": {
+        "gt_pairs": 6156,
+        "hdc_cand": 8099,
+        "hdc_true": 4896,
+        "hdc_geom_pass": 1007
+      },
+      "ate_imu": 0.34125739336013794,
+      "ate_ol": 0.38711316940393614,
+      "ate_cl_off": 0.38711316940393614,
+      "ate_cl_on": 0.24366739897633108,
+      "final_cl_off": 0.737308193834544,
+      "final_cl_on": 0.5619318877307229
+    },
+    {
+      "seed": 1263,
+      "n_steps": 2000,
+      "n_loop_closures": 253,
+      "n_nodes": 286,
+      "n_lc_true_pos": 253,
+      "lc_precision": 1.0,
+      "lc_audit": {
+        "gt_pairs": 8720,
+        "hdc_cand": 6563,
+        "hdc_true": 5557,
+        "hdc_geom_pass": 3572
+      },
+      "ate_imu": 0.077335424721241,
+      "ate_ol": 0.048548041554391116,
+      "ate_cl_off": 0.048548041554391116,
+      "ate_cl_on": 0.019819717121060232,
+      "final_cl_off": 0.022174391655047077,
+      "final_cl_on": 0.018868812891460647
+    }
+  ],
+  "summary": {
+    "mode": "compare_lc",
+    "course_type": "circuit_alias",
+    "n_seeds": 12,
+    "n_steps": 2000,
+    "ate_imu_cm": {
+      "mean": 18.801520578563213,
+      "std": 9.76972044762629,
+      "ci95": [
+        13.283966913198434,
+        24.474981911480416
+      ]
+    },
+    "ate_ol_cm": {
+      "mean": 20.531954474058452,
+      "std": 11.709643069778588,
+      "ci95": [
+        13.930520396081935,
+        27.320361489447052
+      ]
+    },
+    "ate_cl_off_cm": {
+      "mean": 20.531954474058452,
+      "std": 11.709643069778588,
+      "ci95": [
+        13.930520396081935,
+        27.320361489447052
+      ]
+    },
+    "ate_cl_on_cm": {
+      "mean": 10.657270081545311,
+      "std": 8.420040675708927,
+      "ci95": [
+        6.006122004224592,
+        15.600599550880537
+      ]
+    },
+    "lc_delta_cm": {
+      "mean": 9.87468439251314,
+      "ci95": [
+        7.394717036362067,
+        12.399930625537154
+      ]
+    },
+    "lcs": {
+      "mean": 237.91666666666666,
+      "std": 21.77329531533729,
+      "min": 197,
+      "max": 265
+    },
+    "lc_precision": {
+      "pooled": 0.9898423817863398,
+      "total_closures": 2855,
+      "total_true_pos": 2826,
+      "gt_tp_radius_m": 0.3
+    },
+    "lc_pre_gate_audit": {
+      "gt_pairs": 99480,
+      "hdc_cand": 110932,
+      "hdc_true": 70578,
+      "hdc_geom_pass": 24980,
+      "pre_gate_precision": 0.6362275988894097,
+      "recall": 0.709469240048251,
+      "gate_rejected": 85952
+    },
+    "improvement_pct_on_vs_off": 48.09422505290243,
+    "gate_B_pass": true,
+    "loop_scale_ratio": {
+      "mean": 0.992397370088573,
+      "min": 0.8958226666092708,
+      "max": 1.1048984160823254,
+      "source": "relaxed keyframe-node radius vs ground-truth node radius, per seed"
+    }
+  }
+}

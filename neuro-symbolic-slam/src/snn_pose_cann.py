@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""
+snn_pose_cann.py — The "Where Am I?" Module
+
+2D Spatial CANN (x, y) + 1D Ring Attractor (θ) with ANALYTICAL DoG weights.
+Receives IMU velocity injection and corrective current from the Map module.
+
+Key changes for v3 (Repaired) — Parallel Ring Memory + Global Divisive Normalization:
+  - Dual map correction inputs: map_correction_place AND map_correction_ring
+  - Ring injection: map_correction_ring is NO LONGER zeroed out
+  - Stabilized Global Divisive Normalization (prevents gain collapse & 2-bump extinction)
+  - Exact Exponential Euler Integration (prevents blowups)
+  - Auto-freezing Cerebellum during loop closures
+
+Architecture:
+  IMU [vx, vy, ω] → velocity_injection (asymmetric DoG) → bump shift
+                          ↑
+  I_map_corr_place  ← ghost bump for CANN (loop closure position)
+  I_map_corr_ring   ← ghost bump for Ring (loop closure heading)
+                          ↓
+  2D CANN sheet (DoG weights) ←→ recurrent (x,y) bump
+                          ↓
+  1D Ring Attractor (DoG weights) ←→ recurrent θ bump
+                          ↓
+  Readout → [x̂, ŷ, θ̂]
+
+Author: Ada 🦊
+Mathematical framework: Mexican Hat / Difference of Gaussians (DoG)
+"""
+
+import os
+import jax
+import jax.numpy as jnp
+from jax import random
+import numpy as np
+
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from src.sparse_forest import (
+    N_PIXELS, TIME_STEPS, DT,
+    ROOM_W, ROOM_H,
+    VX_RANGE, VY_RANGE, OMEGA_RANGE,
+)
+
+# ============================================================================
+# Configuration (same as snn_slam_twin.py — the proven DoG parameters)
+# ============================================================================
+
+# Multi-Module Grid Cells (2D spatial sheets)
+CANN_SIZES = [11, 13, 17]        # Neurons per edge for Module 1, 2, 3
+WRAP_SCALES = [0.6, 0.8, 1.06]   # ×0.2 from 10m-room [3.0,4.0,5.3]; same WRAP/ROOM_W ratio
+TOTAL_GRID_DIM = sum([s**2 for s in CANN_SIZES]) # 121 + 169 + 289 = 579 neurons
+
+A_EXC = 0.5             
+A_INH = 0.125           
+SIGMA_EXC = 1.0         
+SIGMA_INH = 2.0         
+TAU_U = 0.05
+
+# Ring Attractor (1D heading)
+RING_N = 64             # 64 neurons for 360°
+RING_A_EXC = 1.0        # excitatory amplitude
+RING_A_INH = float(os.environ.get('RING_A_INH', '0.50'))   # inhibitory amplitude (Mexican Hat)
+# a_inh=0.50 gives a velocity dead zone below ~0.5 rad/s and ~48% over-advection above
+# it. a_inh=0.15 makes the advection linear to 0.7% across 0.1-2.0 rad/s while still holding
+# position (5 s zero-input drift -0.13 deg) and forming a single bump. Set RING_A_INH=0.15 to adopt.
+RING_SIGMA_EXC = 2.0    # excitatory spread (neuron units)
+RING_SIGMA_INH = 4.0    # inhibitory spread (neuron units)
+RING_TAU_U = 0.01
+
+# Spiking LIF
+BETA_LIF = 0.85
+V_TH = 1.0
+
+# Velocity injection gains
+# VEL_GAIN_XY must be scaled with WRAP_SCALES: density_factor = c_size/scale.
+# Old 10m room: WRAP_SCALES[0]=3.0, slam_scale=10.0 → density_factor=3.67, V_map_x is 10x larger.
+# New  2m room: WRAP_SCALES[0]=0.6, slam_scale=1.0  → density_factor=18.3, V_map_x is 10x smaller.
+# The product (V_map_x * density_factor) is actually 2x smaller than before.
+# Therefore, we need to INCREASE the gain (0.10 → 0.15) and allow it to learn higher.
+VEL_GAIN_XY = 0.035     # velocity → bump shift (calibrated for 2m room)
+VEL_GAIN_TH = 0.35     # omega → ring shift (calibrated for 2m room)
+
+
+
+
+# ============================================================================
+# 1. Analytical DoG Weight Matrices
+# ============================================================================
+
+def build_2d_cann_weights(cann_size, a_exc=A_EXC, a_inh=A_INH,
+                          sigma_exc=SIGMA_EXC, sigma_inh=SIGMA_INH):
+    """Build 2D CANN recurrent weight matrix: W_ij = A_exc·G_exc(d_ij) - A_inh·G_inh(d_ij)"""
+    x_1d = jnp.arange(cann_size, dtype=jnp.float32)
+
+    src_x_4d = jnp.broadcast_to(x_1d[None, None, None, :], (cann_size, cann_size, cann_size, cann_size))
+    src_y_4d = jnp.broadcast_to(x_1d[None, None, :, None], (cann_size, cann_size, cann_size, cann_size))
+    dst_x_4d = jnp.broadcast_to(x_1d[None, :, None, None], (cann_size, cann_size, cann_size, cann_size))
+    dst_y_4d = jnp.broadcast_to(x_1d[:, None, None, None], (cann_size, cann_size, cann_size, cann_size))
+
+    dx = jnp.minimum(jnp.abs(src_x_4d - dst_x_4d), cann_size - jnp.abs(src_x_4d - dst_x_4d))
+    dy = jnp.minimum(jnp.abs(src_y_4d - dst_y_4d), cann_size - jnp.abs(src_y_4d - dst_y_4d))
+    d2 = dx**2 + dy**2
+
+    W_4d_unnorm = (a_exc * jnp.exp(-d2 / (2 * sigma_exc**2))
+                   - a_inh * jnp.exp(-d2 / (2 * sigma_inh**2)))
+
+    self_conn_unnorm = a_exc - a_inh
+    W_4d = (W_4d_unnorm / (self_conn_unnorm + 1e-8))
+
+    W = W_4d.reshape(cann_size * cann_size, cann_size * cann_size)
+    return W
+
+
+def build_1d_ring_weights(ring_n=RING_N, a_exc=RING_A_EXC, a_inh=RING_A_INH,
+                          sigma_exc=RING_SIGMA_EXC, sigma_inh=RING_SIGMA_INH):
+    """Build 1D ring attractor weight matrix using INTEGER INDEX distance."""
+    rows = []
+    for i in range(ring_n):
+        d = jnp.arange(ring_n, dtype=jnp.float32)
+        d = jnp.abs(d - i)
+        d = jnp.minimum(d, ring_n - d)
+        w = (a_exc * jnp.exp(-d**2 / (2 * sigma_exc**2))
+             - a_inh * jnp.exp(-d**2 / (2 * sigma_inh**2)))
+        rows.append(w)
+    W = jnp.stack(rows)
+    W = W / (W[0, 0] + 1e-8)
+    return W
+
+
+def build_asymmetric_ring_weights(ring_n=RING_N, sigma=RING_SIGMA_EXC):
+    """Asymmetric weight matrix for ω → bump shift."""
+    rows = []
+    for i in range(ring_n):
+        n = jnp.arange(ring_n, dtype=jnp.float32)
+        diff = n - i
+        diff = jnp.where(diff > ring_n / 2, diff - ring_n, diff)
+        diff = jnp.where(diff < -ring_n / 2, diff + ring_n, diff)
+        w_asym = diff * jnp.exp(-diff**2 / (2 * sigma**2))
+        rows.append(w_asym)
+    W_asym = jnp.stack(rows)
+    W_asym = W_asym / (jnp.abs(W_asym).max() + 1e-8)
+    return W_asym
+
+
+def build_asymmetric_cann_weights_x(cann_size, sigma=SIGMA_EXC):
+    """Asymmetric weight matrix for vx → bump shift along x-axis."""
+    x_c = jnp.arange(cann_size, dtype=jnp.float32)
+    y_c = jnp.arange(cann_size, dtype=jnp.float32)
+
+    dx = x_c[:, None] - x_c[None, :]
+    dx = jnp.where(dx > cann_size/2, dx - cann_size, dx)
+    dx = jnp.where(dx < -cann_size/2, dx + cann_size, dx)
+    k_x = dx * jnp.exp(-dx**2 / (2 * sigma**2))
+
+    dy = y_c[:, None] - y_c[None, :]
+    dy = jnp.where(dy > cann_size/2, dy - cann_size, dy)
+    dy = jnp.where(dy < -cann_size/2, dy + cann_size, dy)
+    G_y = jnp.exp(-dy**2 / (2 * sigma**2))
+
+    k_x_4d = k_x[None, :, None, :]
+    G_y_4d = G_y[:, None, :, None]
+    W_4d = k_x_4d * G_y_4d
+
+    W = W_4d.reshape(cann_size * cann_size, cann_size * cann_size)
+    W = W / (jnp.abs(W).max() + 1e-8)
+    return W
+
+
+def build_asymmetric_cann_weights_y(cann_size, sigma=SIGMA_EXC):
+    """Asymmetric weight matrix for vy → bump shift along y-axis."""
+    x_c = jnp.arange(cann_size, dtype=jnp.float32)
+    y_c = jnp.arange(cann_size, dtype=jnp.float32)
+
+    dx = x_c[:, None] - x_c[None, :]
+    dx = jnp.where(dx > cann_size/2, dx - cann_size, dx)
+    dx = jnp.where(dx < -cann_size/2, dx + cann_size, dx)
+    G_x = jnp.exp(-dx**2 / (2 * sigma**2))
+
+    dy = y_c[:, None] - y_c[None, :]
+    dy = jnp.where(dy > cann_size/2, dy - cann_size, dy)
+    dy = jnp.where(dy < -cann_size/2, dy + cann_size, dy)
+    k_y = dy * jnp.exp(-dy**2 / (2 * sigma**2))
+
+    G_x_4d = G_x[None, :, None, :]
+    k_y_4d = k_y[:, None, :, None]
+    W_4d = G_x_4d * k_y_4d
+
+    W = W_4d.reshape(cann_size * cann_size, cann_size * cann_size)
+    W = W / (jnp.abs(W).max() + 1e-8)
+    return W
+
+
+# ============================================================================
+# 2. Neural Field Dynamics
+# ============================================================================
+
+def neural_field_update(u, r, W, I_ext, dt=DT, tau=0.05):
+    """Discrete neural field: Exact Exponential Integration to prevent instability.
+
+    NOTE: the attitude/grid/place attractors are RATE-CODED -- this continuous leaky
+    integrator is their only dynamics; there is no LIF threshold+reset in the attractor
+    loop. (A graded-LIF step lives in the spiking vision path, snn_vision_stdp.py.)
+    """
+    decay = jnp.exp(-dt / tau)
+    drive = (jnp.einsum('ij,bj->bi', W, r) + I_ext) * (1.0 - decay)
+    return decay * u + drive
+
+
+# ============================================================================
+# 3. State Readout from Attractors
+# ============================================================================
+
+def ring_readout(state, ring_n=RING_N):
+    """Read θ from ring using circular statistics."""
+    angles = jnp.arange(ring_n, dtype=jnp.float32) * (2 * jnp.pi / ring_n)
+    p = state / (state.sum(axis=1, keepdims=True) + 1e-8)
+    sin_sum = (jnp.sin(angles) * p).sum(axis=1)
+    cos_sum = (jnp.cos(angles) * p).sum(axis=1)
+    theta = jnp.arctan2(sin_sum, cos_sum)  # naturally in (-π, π) — no modulo needed
+    return theta
+
+# ============================================================================
+# Granule Cell Population Coder
+# ============================================================================
+class VelocityPopulationCoder:
+    """Converts scalar velocity magnitude into a 1D Gaussian population code."""
+    def __init__(self, num_neurons=32, min_v=0.0, max_v=1.5, sigma=0.1):
+        self.num_neurons = num_neurons
+        self.centers = jnp.linspace(min_v, max_v, num_neurons)
+        self.sigma = sigma
+
+    def __call__(self, v_mag):
+        v_mag_clamped = jnp.clip(v_mag, self.centers[0], self.centers[-1])
+        diff = v_mag_clamped[:, None] - self.centers[None, :]
+        activations = jnp.exp(-(diff ** 2) / (2 * self.sigma ** 2))
+        return activations / (activations.sum(axis=1, keepdims=True) + 1e-8)
+
+
+# ============================================================================
+# 5. Pose CANN Class
+# ============================================================================
+
+class PoseCANN:
+    # Notice the W_cann parameters are now expected to be lists!
+    def __init__(self, key, W_cann_list, W_ring, W_cann_asym_x_list, W_cann_asym_y_list, W_ring_asym):
+        k1, k2 = random.split(key)
+        self.W_cann_list = W_cann_list
+        self.W_ring = W_ring
+        self.W_cann_asym_x_list = W_cann_asym_x_list
+        self.W_cann_asym_y_list = W_cann_asym_y_list
+        self.W_ring_asym = W_ring_asym
+
+        # State arrays are now lists holding 3 separate JAX arrays
+        self._u_canns = [None, None, None]
+        self._r_canns = [None, None, None]
+        
+        self._u_ring = None
+        self._r_ring = None
+        self._smooth_omega = None
+        
+        self.n_speed_neurons = 32
+        self.vel_coder_xy = VelocityPopulationCoder(self.n_speed_neurons, 0.0, 3.0, 0.2)
+        self.vel_coder_th = VelocityPopulationCoder(self.n_speed_neurons, 0.0, 25.0, 1.5)
+        
+        self.prev_pose_xy = None
+        self.prev_heading = None
+
+        # Hyperparameters for current injection & neuromorphic sensor fusion (Optimized Set)
+        self.VEL_GAIN_XY = 0.05127
+        self.VEL_GAIN_TH = float(os.environ.get('RING_VEL_GAIN', '0.045'))
+        self.alpha_gyro = 0.86862
+        self.k_global_cann = 0.04744
+        self.k_global_cann_scale = 5.27470
+        self.K_GRAVITY = float(os.environ.get('K_GRAVITY', '5.0'))   # the earlier default K=200 is ~40x above optimal;
+        # K~5 lowers mean pitch error 7.44 -> 6.70 deg (paired n=12, CI excludes zero)
+        self.SIGMA_GRAVITY = 0.15
+        self.k_global_ring = 0.07257
+        self.k_global_ring_scale = 12.00000
+        self.base_eta_xy = 0.13791
+        self.base_eta_th = 0.20000
+        self.adrenaline_factor = 0.40581
+        self.clip_xy_min = 0.0
+        self.clip_xy_max = 0.73772
+        self.clip_th_min = 0.01
+        self.clip_th_max = 0.5
+        self.TAU_U = 0.005
+        self.RING_TAU_U = 0.001
+        # Integrated IMU Position Injection Hyperparameters
+        self.K_IMU_POS = 200.0
+        self.SIGMA_IMU_POS = 1.2
+        self.imu_integrated_xy = None
+        self.imu_integrated_th = None
+
+    def reset(self, B):
+        """Reset to centered Gaussian bumps (fallback initialization)."""
+        self.prev_pose_xy = None
+        self.prev_heading = None
+        self.lagged_v_imu = None
+        self.lagged_w_imu = None
+        self._smooth_omega = None
+        self.imu_integrated_xy = jnp.zeros((B, 2))
+        self.imu_integrated_th = jnp.zeros((B,))
+
+        # 1. Loop through all 3 modules to initialize their flat states
+        for i, c_size in enumerate(CANN_SIZES):
+            xx, yy = jnp.meshgrid(
+                jnp.arange(c_size, dtype=jnp.float32),
+                jnp.arange(c_size, dtype=jnp.float32),
+                indexing='ij'
+            )
+            # Center the bump in the middle of the local module
+            bump = jnp.exp(-((xx - c_size//2)**2 + (yy - c_size//2)**2) / (2 * SIGMA_EXC**2))
+            bump = bump / (bump.max() + 1e-8)
+            
+            self._u_canns[i] = jnp.tile(0.5 * bump[None, :, :], (B, 1, 1))
+            self._r_canns[i] = jnp.clip(self._u_canns[i], 0, 1.0)
+
+        idx = jnp.arange(RING_N, dtype=jnp.float32)
+        d = jnp.abs(idx - 0.0)
+        d = jnp.minimum(d, RING_N - d)
+        bump_r = jnp.exp(-d**2 / (2 * RING_SIGMA_EXC**2))
+        bump_r = bump_r / (bump_r.sum() + 1e-8)
+        self._u_ring = jnp.tile(0.5 * bump_r[None, :], (B, 1))
+        self._r_ring = jnp.clip(self._u_ring, 0, 1.0)
+        
+        if getattr(self, 'W_cereb_xy_imu', None) is None or self.W_cereb_xy_imu.shape[0] != B:
+            self.W_cereb_xy_imu = jnp.ones((B, self.n_speed_neurons)) * self.VEL_GAIN_XY
+        if getattr(self, 'W_cereb_xy_vis', None) is None or self.W_cereb_xy_vis.shape[0] != B:
+            self.W_cereb_xy_vis = jnp.ones((B, self.n_speed_neurons)) * self.VEL_GAIN_XY
+        if getattr(self, 'W_cereb_th_imu', None) is None or self.W_cereb_th_imu.shape[0] != B:
+            self.W_cereb_th_imu = jnp.ones((B, self.n_speed_neurons)) * self.VEL_GAIN_TH
+        if getattr(self, 'W_cereb_th_vis', None) is None or self.W_cereb_th_vis.shape[0] != B:
+            self.W_cereb_th_vis = jnp.ones((B, self.n_speed_neurons)) * self.VEL_GAIN_TH
+        
+        self.prev_pose_xy = None
+        self.prev_heading = None
+        self.lagged_v_imu = None
+        self.lagged_v_vis = None
+        self.lagged_w_imu = None
+        self.lagged_w_vis = None
+
+    def initialize_pose(self, gt_pos, gt_heading):
+        B = gt_pos.shape[0]
+        self.imu_integrated_xy = gt_pos
+        self.imu_integrated_th = gt_heading
+        
+        # 1. Initialize the 3 Grid Modules using Modulo Math
+        for i, (c_size, scale) in enumerate(zip(CANN_SIZES, WRAP_SCALES)):
+            local_x = gt_pos[:, 0] % scale
+            local_y = gt_pos[:, 1] % scale
+            
+            cx_float = (local_x / scale) * c_size
+            cy_float = (local_y / scale) * c_size
+
+            xx, yy = jnp.meshgrid(
+                jnp.arange(c_size, dtype=jnp.float32),
+                jnp.arange(c_size, dtype=jnp.float32),
+                indexing='xy'
+            )
+
+            cx_exp = cx_float[:, None, None]
+            cy_exp = cy_float[:, None, None]
+            
+            dx = jnp.minimum(jnp.abs(xx[None, :, :] - cx_exp), c_size - jnp.abs(xx[None, :, :] - cx_exp))
+            dy = jnp.minimum(jnp.abs(yy[None, :, :] - cy_exp), c_size - jnp.abs(yy[None, :, :] - cy_exp))
+            d2 = dx**2 + dy**2
+            
+            bumps = jnp.exp(-d2 / (2 * SIGMA_EXC**2))
+            bumps = bumps / (bumps.max(axis=(1, 2), keepdims=True) + 1e-8)
+            
+            self._u_canns[i] = jnp.clip(bumps, 0, 1.0)
+            self._r_canns[i] = self._u_canns[i]
+
+        th_idx_float = (gt_heading % (2 * jnp.pi)) * (RING_N / (2 * jnp.pi))
+        idx = jnp.arange(RING_N, dtype=jnp.float32)[None, :]
+        th_exp = th_idx_float[:, None]
+        d = jnp.abs(idx - th_exp)
+        d = jnp.minimum(d, RING_N - d)
+        bumps_r = jnp.exp(-d**2 / (2 * RING_SIGMA_EXC**2))
+        bumps_r_norm = bumps_r / (bumps_r.sum(axis=1, keepdims=True) + 1e-8)
+        self._u_ring = 0.5 * bumps_r_norm
+        self._r_ring = jnp.clip(self._u_ring, 0, 1.0)
+        
+        self.prev_pose_xy = gt_pos
+        self.prev_heading = gt_heading
+        self.lagged_v_imu = None
+        self.lagged_v_vis = None
+        self.lagged_w_imu = None
+        self.lagged_w_vis = None
+
+    def __call__(self, kin_t, omega_vis=None, vis_trust=None, v_vis_trans=None, theta_gravity=None, dt=DT):
+        B = kin_t.shape[0]
+        vx_imu, vy_imu, omega_imu = kin_t[:, 0], kin_t[:, 1], kin_t[:, 2]
+
+        # Low-pass filter angular velocity (gyro) input using Exponential Moving Average (EMA)
+        # to filter out high-frequency (115Hz) sinusoidal wingbeat vibrations.
+        alpha = self.alpha_gyro
+        if self._smooth_omega is None or self._smooth_omega.shape[0] != B:
+            self._smooth_omega = omega_imu
+        else:
+            self._smooth_omega = (1.0 - alpha) * self._smooth_omega + alpha * omega_imu
+        omega_imu_filtered = self._smooth_omega
+
+        # Update integrated heading directly from gyro (using raw/unfiltered omega_imu to eliminate lag)
+        self.imu_integrated_th = (self.imu_integrated_th + omega_imu * dt + jnp.pi) % (2 * jnp.pi) - jnp.pi
+
+        # 2nd-Order Midpoint Integration on heading for velocity rotation.
+        #
+        # The body-frame velocity (vx forward, vy sideslip) must be rotated by the body's
+        # attitude to obtain world-frame displacement, so whichever attitude estimate is used
+        # HERE determines how attitude error leaks into position error.
+        #
+        #   DEFAULT (SLAM_COUPLE_HEADING=1): rotate by the attractor's own attitude readout
+        #       (gravity-anchored when K_GRAVITY>0). This is the physically consistent choice
+        #       -- an estimator must use its best attitude estimate to rotate body velocity --
+        #       and it lets the gravity anchor reduce position drift.
+        #   legacy (SLAM_COUPLE_HEADING=0): rotate by the raw gyro-integrated heading. The
+        #       gravity anchor then never enters the translation path, so position is
+        #       invariant to K_GRAVITY. Retained only to reproduce the decoupled ablation.
+        if os.environ.get('SLAM_COUPLE_HEADING', '1') == '1':
+            theta_est = ring_readout(self._r_ring)            # attitude estimate at start of step
+            theta_mid = (theta_est + (omega_imu * dt) / 2.0 + jnp.pi) % (2 * jnp.pi) - jnp.pi
+        else:
+            theta_mid = (self.imu_integrated_th - (omega_imu * dt) / 2.0 + jnp.pi) % (2 * jnp.pi) - jnp.pi
+
+        # Calculate rotation matrices
+        cos_t_mid = jnp.cos(theta_mid)
+        sin_t_mid = jnp.sin(theta_mid)
+
+        # Rotate local velocities into the global frame (IMU)
+        V_map_x_imu = vx_imu * cos_t_mid - vy_imu * sin_t_mid
+        V_map_y_imu = vx_imu * sin_t_mid + vy_imu * cos_t_mid
+
+        # Update integrated position (metric reference)
+        self.imu_integrated_xy = self.imu_integrated_xy + jnp.stack([V_map_x_imu, V_map_y_imu], axis=-1) * dt
+
+        v_mag_xy_imu = jnp.sqrt(V_map_x_imu**2 + V_map_y_imu**2)
+        spikes_xy_imu = self.vel_coder_xy(v_mag_xy_imu)
+        dynamic_gain_xy_imu = jnp.sum(spikes_xy_imu * self.W_cereb_xy_imu, axis=1)
+
+        # Rotate local velocities for Vision (Optic Flow + ToF scaling)
+        if v_vis_trans is not None:
+            vx_vis = v_vis_trans[:, 0]
+            vy_vis = v_vis_trans[:, 1]
+            V_map_x_vis = vx_vis * cos_t_mid - vy_vis * sin_t_mid
+            V_map_y_vis = vx_vis * sin_t_mid + vy_vis * cos_t_mid
+            
+            v_mag_xy_vis = jnp.sqrt(V_map_x_vis**2 + V_map_y_vis**2)
+            spikes_xy_vis = self.vel_coder_xy(v_mag_xy_vis)
+            dynamic_gain_xy_vis = jnp.sum(spikes_xy_vis * self.W_cereb_xy_vis, axis=1)
+        else:
+            V_map_x_vis = jnp.zeros_like(V_map_x_imu)
+            V_map_y_vis = jnp.zeros_like(V_map_y_imu)
+            dynamic_gain_xy_vis = jnp.zeros_like(dynamic_gain_xy_imu)
+
+        # Iterate over the 3 spatial modules
+        # Scale velocity injection by dt/DT so bump displacement matches real elapsed time,
+        # while neural field dynamics (decay, tau) remain at intrinsic DT.
+        vel_time_scale = dt / DT
+        for i, (c_size, scale) in enumerate(zip(CANN_SIZES, WRAP_SCALES)):
+            r_flat = self._r_canns[i].reshape(B, -1)
+            
+            # Density scaling: Smaller wrap scales mean the bump must traverse neurons faster!
+            density_factor = c_size / scale 
+            
+            # IMU Current Component
+            scaled_vel_x_imu = V_map_x_imu * density_factor * vel_time_scale
+            scaled_vel_y_imu = V_map_y_imu * density_factor * vel_time_scale
+            I_vel_x_imu = dynamic_gain_xy_imu[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_x_list[i], r_flat) * scaled_vel_x_imu[:, None]
+            I_vel_y_imu = dynamic_gain_xy_imu[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_y_list[i], r_flat) * scaled_vel_y_imu[:, None]
+
+            # Vision Current Component
+            scaled_vel_x_vis = V_map_x_vis * density_factor * vel_time_scale
+            scaled_vel_y_vis = V_map_y_vis * density_factor * vel_time_scale
+            I_vel_x_vis = dynamic_gain_xy_vis[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_x_list[i], r_flat) * scaled_vel_x_vis[:, None]
+            I_vel_y_vis = dynamic_gain_xy_vis[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_y_list[i], r_flat) * scaled_vel_y_vis[:, None]
+
+            # Symmetric Bump current injection based on Integrated IMU position (modulo wrap scale)
+            local_x = self.imu_integrated_xy[:, 0] % scale
+            local_y = self.imu_integrated_xy[:, 1] % scale
+            cx_float = (local_x / scale) * c_size
+            cy_float = (local_y / scale) * c_size
+            xx, yy = jnp.meshgrid(
+                jnp.arange(c_size, dtype=jnp.float32),
+                jnp.arange(c_size, dtype=jnp.float32),
+                indexing='xy'
+            )
+            cx_exp = cx_float[:, None, None]
+            cy_exp = cy_float[:, None, None]
+            dx = jnp.minimum(jnp.abs(xx[None, :, :] - cx_exp), c_size - jnp.abs(xx[None, :, :] - cx_exp))
+            dy = jnp.minimum(jnp.abs(yy[None, :, :] - cy_exp), c_size - jnp.abs(yy[None, :, :] - cy_exp))
+            d2 = dx**2 + dy**2
+
+            # Form Gaussian bump input
+            I_imu_pos = self.K_IMU_POS * jnp.exp(-d2 / (2 * self.SIGMA_IMU_POS**2))
+
+            # Biophysical Summation (add the integrated position injection)
+            I_total_spatial = (I_vel_x_imu + I_vel_y_imu) + (I_vel_x_vis + I_vel_y_vis) + I_imu_pos.reshape(B, -1)
+
+            u_flat = self._u_canns[i].reshape(B, -1)
+            u_new = neural_field_update(
+                u_flat, r_flat + 1e-8, self.W_cann_list[i],
+                I_total_spatial, 
+                dt=DT, tau=self.TAU_U
+            )
+
+            self._u_canns[i] = u_new.reshape(B, c_size, c_size)
+
+            # Global Divisive Normalization for this specific module
+            k_global_cann = self.k_global_cann
+            r_raw = jnp.maximum(0.0, self._u_canns[i])
+            raw_sum = r_raw.sum(axis=(1, 2), keepdims=True)
+            global_inhibition = 1.0 + k_global_cann * raw_sum 
+            baseline_inhibition = 1.0 + k_global_cann * self.k_global_cann_scale
+            self._r_canns[i] = (r_raw / global_inhibition) * baseline_inhibition
+
+        # ---- Ring Attractor Substepping ----
+        # Anchor target: the ABSOLUTE attitude estimated by the spiking complementary gravity
+        # filter (theta_gravity), when available. This is the gravity-anchored current injection
+        # that bounds drift. Falls back to integrated gyro only if no gravity estimate is passed
+        # (open-loop / unanchored configuration), in which case K_GRAVITY should be 0.
+        target_th = theta_gravity if theta_gravity is not None else self.imu_integrated_th
+
+        angles = jnp.arange(RING_N, dtype=jnp.float32) * (2.0 * jnp.pi / RING_N)
+        diff = angles[None, :] - target_th[:, None]
+        diff_wrapped = jnp.mod(diff + jnp.pi, 2 * jnp.pi) - jnp.pi
+        
+        K_GRAVITY = self.K_GRAVITY
+        SIGMA_GRAVITY = self.SIGMA_GRAVITY
+        I_gravity = K_GRAVITY * jnp.exp(- (diff_wrapped ** 2) / (2.0 * (SIGMA_GRAVITY ** 2)))
+
+        # Velocity injection setup (constant inputs outside substepping loop)
+        spikes_th_imu = self.vel_coder_th(jnp.abs(omega_imu))
+        dynamic_gain_th_imu = jnp.sum(spikes_th_imu * self.W_cereb_th_imu, axis=1)
+
+        if omega_vis is not None and vis_trust is not None:
+            omega_vis_weighted = vis_trust * omega_vis
+            spikes_th_vis = self.vel_coder_th(jnp.abs(omega_vis_weighted))
+            dynamic_gain_th_vis = jnp.sum(spikes_th_vis * self.W_cereb_th_vis, axis=1)
+        else:
+            omega_vis_weighted = None
+            dynamic_gain_th_vis = None
+
+        # 10 substeps for ring attractor integration
+        sub_steps = 10
+        sub_dt = dt / float(sub_steps)
+        vel_time_scale_sub = sub_dt / DT
+
+        # We loop to update self._u_ring and self._r_ring
+        for _ in range(sub_steps):
+            I_vel_raw_imu = -dynamic_gain_th_imu[:, None] * omega_imu[:, None] * vel_time_scale_sub * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
+
+            if omega_vis_weighted is not None:
+                I_vel_raw_vis = -dynamic_gain_th_vis[:, None] * omega_vis_weighted[:, None] * vel_time_scale_sub * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
+            else:
+                I_vel_raw_vis = 0.0
+
+            I_vel_raw = I_vel_raw_imu + I_vel_raw_vis
+            I_vel_smooth = (jnp.roll(I_vel_raw, 1, axis=1) + I_vel_raw + jnp.roll(I_vel_raw, -1, axis=1)) / 3.0
+
+            I_ext = I_vel_smooth + I_gravity
+
+            u_ring_new = neural_field_update(
+                self._u_ring, self._r_ring + 1e-8, self.W_ring,
+                I_ext, 
+                dt=sub_dt, tau=self.RING_TAU_U
+            )
+            self._u_ring = u_ring_new
+
+            # Global Divisive Normalization for Ring
+            k_global_ring = self.k_global_ring
+            r_ring_raw = jnp.maximum(0.0, self._u_ring)
+            ring_sum = r_ring_raw.sum(axis=1, keepdims=True)
+            global_inhibition_ring = 1.0 + k_global_ring * ring_sum 
+            baseline_ring_inh = 1.0 + k_global_ring * self.k_global_ring_scale
+            self._r_ring = (r_ring_raw / global_inhibition_ring) * baseline_ring_inh
+
+        # ---- Readout ----
+        dummy_pos = jnp.zeros((B, 2)) 
+        th = ring_readout(self._r_ring)[:, None]
+        return jnp.concatenate([dummy_pos, th], axis=1)
+
+    def update_cerebellum(self, kin_t, pose_xy, current_heading, omega_vis=None, vis_trust=None, v_vis_trans=None, dt=DT):
+        # Check if the lagged variables exist yet!
+        # This catches cases where initialize_pose() pre-filled prev_pose_xy.
+        if getattr(self, 'lagged_v_imu', None) is None or self.prev_pose_xy is None:
+            self.prev_pose_xy = pose_xy
+            self.prev_heading = current_heading
+            
+            # Prime the low-pass target filters safely on the first frame
+            self.lagged_v_imu = kin_t[:, 0]
+            self.lagged_v_vis = v_vis_trans[:, 0] if v_vis_trans is not None else jnp.zeros_like(kin_t[:, 0])
+            self.lagged_w_imu = kin_t[:, 2]
+            if omega_vis is not None and vis_trust is not None:
+                self.lagged_w_vis = vis_trust * omega_vis
+            else:
+                self.lagged_w_vis = jnp.zeros_like(kin_t[:, 2])
+            return
+
+        v_bump_x = (pose_xy[:, 0] - self.prev_pose_xy[:, 0]) / dt
+        v_bump_y = (pose_xy[:, 1] - self.prev_pose_xy[:, 1]) / dt
+        cos_t = jnp.cos(self.prev_heading)
+        sin_t = jnp.sin(self.prev_heading)
+        v_bump_forward = v_bump_x * cos_t + v_bump_y * sin_t
+
+        v_bump_omega = (current_heading - self.prev_heading + jnp.pi) % (2 * jnp.pi) - jnp.pi
+        v_bump_omega = v_bump_omega / dt
+
+        v_imu_forward = kin_t[:, 0]
+        v_imu_omega = kin_t[:, 2]
+
+        v_vis_forward = v_vis_trans[:, 0] if v_vis_trans is not None else jnp.zeros_like(kin_t[:, 0])
+        if omega_vis is not None and vis_trust is not None:
+            v_vis_omega = vis_trust * omega_vis
+        else:
+            v_vis_omega = jnp.zeros_like(kin_t[:, 2])
+
+        # Apply Neural Inertia (Low-Pass) to the Targets
+        decay_xy = jnp.exp(-dt / self.TAU_U)
+        decay_th = jnp.exp(-dt / self.RING_TAU_U)
+        
+        self.lagged_v_imu = decay_xy * self.lagged_v_imu + (1.0 - decay_xy) * v_imu_forward
+        self.lagged_v_vis = decay_xy * self.lagged_v_vis + (1.0 - decay_xy) * v_vis_forward
+        self.lagged_w_imu = decay_th * self.lagged_w_imu + (1.0 - decay_th) * v_imu_omega
+        self.lagged_w_vis = decay_th * self.lagged_w_vis + (1.0 - decay_th) * v_vis_omega
+
+        # Calculate Error (Comparing against the true IMU kinematic reference to prevent tug-of-war)
+        error_forward_imu = jnp.clip(self.lagged_v_imu - v_bump_forward, -3.0, 3.0)
+        error_forward_vis = jnp.clip(self.lagged_v_imu - v_bump_forward, -3.0, 3.0)
+        error_omega_imu = jnp.clip(self.lagged_w_imu - v_bump_omega, -3.0, 3.0)
+        error_omega_vis = jnp.clip(self.lagged_w_imu - v_bump_omega, -3.0, 3.0)
+
+        v_imu_mag = jnp.sqrt(kin_t[:, 0]**2 + kin_t[:, 1]**2)
+        v_vis_mag = jnp.sqrt(v_vis_forward**2 + (v_vis_trans[:, 1]**2 if v_vis_trans is not None else 0.0) + 1e-8)
+        
+        speed_spikes_xy_imu = self.vel_coder_xy(v_imu_mag)
+        speed_spikes_xy_vis = self.vel_coder_xy(v_vis_mag)
+        speed_spikes_th_imu = self.vel_coder_th(jnp.abs(v_imu_omega))
+        speed_spikes_th_vis = self.vel_coder_th(jnp.abs(v_vis_omega))
+        
+        base_eta_xy = self.base_eta_xy
+        base_eta_th = self.base_eta_th
+        
+        # Soften the adrenaline so it amplifies without exploding
+        adrenaline_xy_imu = 1.0 + self.adrenaline_factor * jnp.abs(error_forward_imu[:, None])
+        adrenaline_xy_vis = 1.0 + self.adrenaline_factor * jnp.abs(error_forward_vis[:, None])
+        adrenaline_th_imu = 1.0 + self.adrenaline_factor * jnp.abs(error_omega_imu[:, None])
+        adrenaline_th_vis = 1.0 + self.adrenaline_factor * jnp.abs(error_omega_vis[:, None])
+
+        dynamic_eta_xy_imu = base_eta_xy * adrenaline_xy_imu
+        dynamic_eta_xy_vis = base_eta_xy * adrenaline_xy_vis
+        dynamic_eta_th_imu = base_eta_th * adrenaline_th_imu
+        dynamic_eta_th_vis = base_eta_th * adrenaline_th_vis
+        
+        delta_W_xy_imu = dynamic_eta_xy_imu * error_forward_imu[:, None] * jnp.sign(self.lagged_v_imu)[:, None] * speed_spikes_xy_imu
+        delta_W_xy_vis = dynamic_eta_xy_vis * error_forward_vis[:, None] * jnp.sign(self.lagged_v_vis)[:, None] * speed_spikes_xy_vis
+        
+        delta_W_th_imu = dynamic_eta_th_imu * error_omega_imu[:, None] * jnp.sign(self.lagged_w_imu)[:, None] * speed_spikes_th_imu
+        delta_W_th_vis = dynamic_eta_th_vis * error_omega_vis[:, None] * jnp.sign(self.lagged_w_vis)[:, None] * speed_spikes_th_vis
+
+        self.W_cereb_xy_imu = jnp.clip(self.W_cereb_xy_imu + delta_W_xy_imu, self.clip_xy_min, self.clip_xy_max)
+        self.W_cereb_xy_vis = jnp.clip(self.W_cereb_xy_vis + delta_W_xy_vis, self.clip_xy_min, self.clip_xy_max)
+        self.W_cereb_th_imu = jnp.clip(self.W_cereb_th_imu + delta_W_th_imu, self.clip_th_min, self.clip_th_max)
+        self.W_cereb_th_vis = jnp.clip(self.W_cereb_th_vis + delta_W_th_vis, self.clip_th_min, self.clip_th_max)
+
+        self.prev_pose_xy = pose_xy
+        self.prev_heading = current_heading
+
+    def get_state_flat(self):
+        """Returns the 579-dim Cryptographic Grid Key"""
+        B = self._r_canns[0].shape[0]
+        flats = [r.reshape(B, -1) for r in self._r_canns]
+        return jnp.concatenate(flats, axis=1)
+
+    def get_ring_activity(self):
+        return self._r_ring
+
+    def estimate_heading(self):
+        return ring_readout(self._r_ring)

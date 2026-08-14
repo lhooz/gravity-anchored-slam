@@ -1,0 +1,1203 @@
+#!/usr/bin/env python3
+"""
+snn_slam_system.py — Neuromorphic SLAM Orchestrator (v10)
+
+Integrates three biological modules into a closed-loop navigation system:
+
+  1. VisionCSNN   (256 feature neurons) — event-based edge features
+  2. PoseCANN     (579 grid cell spatial + 64 heading) — dead-reckoning via IMU
+  3. PlaceCellNetwork + Parallel Ring Memory — depth-aware spatial memory
+
+================================================================
+  PARALLEL RING MEMORY + DUAL-KEY GATING — INSECT BRAIN v10
+================================================================
+
+Problem: Pure vision loop closures are ambiguous (same wall = same memory).
+Solution: Dual-Key gating — BOTH place cells (WHERE) AND ring cells (WHICH WAY)
+must agree, plus heading plausibility check eliminates false positives.
+
+Author: Ada 🦊
+"""
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+
+import jax
+import jax.numpy as jnp
+from jax import random
+from functools import partial
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.transforms as mtransforms
+from matplotlib.patches import Rectangle, FancyArrow
+import time, sys
+import collections
+import io          # For safe memory buffers
+import imageio     # For GIF generation
+
+
+
+# ============================================================================
+# workspace
+# ============================================================================
+
+# Dynamically find the project root (one folder up from where this script lives)
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.sparse_forest import (
+    generate_fixed_room_dataset,
+    N_PIXELS, TIME_STEPS, DT,
+    ROOM_W, ROOM_H, FOV_DEG,
+    VX_RANGE, VY_RANGE, OMEGA_RANGE,
+)
+from src.snn_vision_fusion import DualStreamVisionCortex
+from src.snn_pose_cann import (
+    PoseCANN,
+    build_2d_cann_weights,
+    build_1d_ring_weights,
+    build_asymmetric_ring_weights,
+    build_asymmetric_cann_weights_x,
+    build_asymmetric_cann_weights_y,
+    CANN_SIZES, WRAP_SCALES, TOTAL_GRID_DIM, RING_N,
+    ring_readout,
+)
+from src.snn_place_cells import (
+    PlaceCellNetwork,
+    N_PLACE,
+)
+
+# ============================================================================
+# flyhash sparse-code map configuration
+# ============================================================================
+FLYHASH_CONFIG = {
+    "num_bits": 256,         # 256 bits avoids false-positive hash collisions
+    "active_spikes_k": int(os.environ.get("FLYHASH_K", "32")),  # k=8 discarded ~1/3 of the CSNN's
+    # learned discriminability (AUC 0.933 -> 0.872); k=32 recovers most of it at matched precision.
+    "match_threshold": 5,    # minimum overlapping active bits for a candidate hash match
+}
+
+# ============================================================================
+#  🎛️  HYPERPARAMETERS
+# ============================================================================
+
+N_VISION        = 256     # VisionCSNN feature neurons
+
+N_DEPTH_PER_RAY = 64
+N_DEPTH         = N_DEPTH_PER_RAY * 3  # 192 Total Apical Dendrites
+
+TOF_MIN         = 0.1    # meters
+TOF_MAX         = 2.83   # meters — max diagonal of 2m×2m room (√(2²+2²))
+TOF_SIGMA       = 0.25   # tof precision
+
+DRIFT_START     = 5000     # (Offline Default) step at which drift kicks in
+# The token DRIFT_OMEGA is retired. A realistic MEMS gyro-error model (constant
+# per-trial bias + slow rate random-walk, on top of the 115 Hz wingbeat vibration) is now
+# injected into the gyro stream at the source (LiveEnvironment.generate_new_chunk), so it
+# is identical for the IMU / open-loop / closed-loop paths and dead-reckoning genuinely
+# drifts. DRIFT_OMEGA is kept at 0.0 only so the legacy `+ DRIFT_OMEGA` call-sites are no-ops.
+DRIFT_OMEGA     = 0.0
+GYRO_BIAS_STD   = 0.025   # rad/s : std of the per-trial constant gyro bias (cheap MEMS)
+GYRO_RW_SIGMA   = 0.0015  # rad/s : per-step gyro rate random-walk increment std
+
+# --- S2: wingbeat vibration injected into the IMU stream (gyro + accelerometer) ---
+# HARDWARE SAMPLING RATES. The sensors do NOT share the estimator's clock. A MEMS IMU samples
+# at ~1 kHz (IMU_OVERSAMPLE x the 1/DT = 50 Hz estimator rate), so the 115 Hz wingbeat is
+# properly represented on the IMU and is NOT aliased. What the estimator consumes each step is
+# the MEAN angular rate / specific force over that step -- exactly what integrating the IMU at
+# its native rate over the interval yields. A zero-mean tone is therefore attenuated by
+# |sinc(f*DT)| (115 Hz -> 0.112, i.e. 8.9x) rather than folding down to a fictitious low
+# frequency. Tones at exact multiples of 1/DT integrate to zero over the step -- a real physical
+# null (a whole number of periods), not a point-sampling artifact.
+IMU_OVERSAMPLE  = 20      # IMU samples per estimator step (20 / 0.02 s = 1 kHz MEMS IMU)
+VIB_ENABLE      = True
+VIB_FREQ        = 115.0   # Hz wingbeat frequency (properly sampled by the 1 kHz IMU)
+VIB_GYRO_AMP    = 0.20    # rad/s gyro vibration amplitude (at the IMU, before rate-averaging)
+VIB_ACC_AMP     = 0.50    # m/s^2 accelerometer vibration amplitude (at the IMU)
+
+
+def imu_rate_average(freq, amp, dt, steps, phase0=0.0, t0=0.0, oversample=None):
+    """The estimator-rate signal an IMU delivers for a vibration tone.
+
+    The IMU samples at `oversample`/dt (default IMU_OVERSAMPLE/DT = 1 kHz), where `freq` is
+    properly represented; the estimator consumes the MEAN over each step (what integrating the
+    rate over the interval gives). Returns a length-`steps` array at the estimator rate.
+
+    This is the SINGLE source of truth for the IMU front-end: the deployed LiveEnvironment and
+    the figure-side ring diagnostics both use it, so they cannot diverge. No synthetic
+    anti-alias filter is involved -- the rate separation is the physics.
+    """
+    OS = int(oversample or IMU_OVERSAMPLE)
+    t = t0 + np.arange(steps * OS, dtype=np.float64) * (dt / OS)
+    return (amp * np.sin(2.0 * np.pi * freq * t + phase0)).reshape(steps, OS).mean(axis=1)
+
+# --- 6.1: realistic event+ToF visual-odometry (VO) translational-velocity error model ---
+# The body-frame translational velocity handed to the position path-integrator is a MODELED
+# event+ToF VO estimate, NOT ground truth. Event-based VO characteristically carries a
+# per-trial multiplicative metric-scale bias, a slowly-varying velocity bias (random walk),
+# and per-step magnitude+direction noise. We inject all three on [vx, vy] at the single kin
+# source (LiveEnvironment.generate_new_chunk), so the IMU / anchor-off / anchor-on paths all
+# consume the SAME noisy VO velocity and differ only in attitude handling and loop closure.
+# The synthesized accelerometer / gravity attitude reference is left untouched (attitude noise
+# is the gyro's). Levels are calibrated to plausible event-VO accuracy (per-step relative
+# velocity error ~8%, metric-scale bias ~4%, slow bias drift); env-overridable for sweeps.
+VO_NOISE_ENABLE = os.environ.get('SLAM_VO_NOISE', '1') == '1'                 # ON by default (realistic VO)
+VO_SCALE_STD    = float(os.environ.get('SLAM_VO_SCALE_STD',   '0.04'))        # per-trial metric-scale bias (frac)
+VO_MAG_REL      = float(os.environ.get('SLAM_VO_MAG_REL',     '0.08'))        # per-step relative magnitude noise
+VO_DIR_STD      = float(os.environ.get('SLAM_VO_DIR_STD',     '0.05'))        # per-step direction noise (rad, ~3 deg)
+VO_BIAS_REL     = float(os.environ.get('SLAM_VO_BIAS_REL',    '0.03'))        # per-trial constant bias (frac of RMS speed)
+VO_BIAS_RW_REL  = float(os.environ.get('SLAM_VO_BIAS_RW_REL', '0.0015'))      # slow bias random-walk (frac of RMS speed / step)
+
+# Complementary-filter accelerometer-correction gain: theta_new = theta_gyro + ALPHA_FUSE*(theta_accel - theta_gyro).
+# Imported by the figure scripts (do not re-hardcode). Env-overridable
+# (SLAM_ALPHA_FUSE) for reproducible gain sweeps.
+ALPHA_FUSE      = float(os.environ.get('SLAM_ALPHA_FUSE', '0.02'))
+
+N_TRAJ_SHOW     = 1
+SAVE_FIG        = True
+
+BASE_LC_FACTOR = 1.20
+LC_MATURITY    = 0.65
+
+# ============================================================================
+#  🧠  TOF POPULATION CODER (Gaussian RBF)
+# ============================================================================
+
+class ToFPopulationCoder:
+    """Convert 3-Ray ToF depth → Gaussian population code."""
+
+    def __init__(self, n_depth_per_ray=N_DEPTH_PER_RAY, tof_min=TOF_MIN, tof_max=TOF_MAX, sigma=TOF_SIGMA):
+        self.n_depth_per_ray = n_depth_per_ray
+        self.sigma = sigma
+        self.centers = jnp.linspace(tof_min, tof_max, n_depth_per_ray)
+
+    def __call__(self, tof_array):
+        B = tof_array.shape[0]
+        diff = tof_array[:, :, None] - jnp.array(self.centers)[None, None, :]
+        activations = jnp.exp(-(diff ** 2) / (2 * self.sigma ** 2))
+        activations = activations / (activations.max(axis=2, keepdims=True) + 1e-8)
+        return activations.reshape(B, -1)
+
+# ============================================================================
+# 🌿 V4: NEUROMORPHIC TOPOLOGICAL RELAXATION (SPRING-MASS-DAMPER PHYSICS)
+# ============================================================================
+
+class SpikingMapState(collections.namedtuple('SpikingMapState', ['v_mem', 'spikes'])):
+    pass
+
+@jax.jit
+def decode_grid_to_xy(grid_key_flat, prior_xy):
+    """
+    Local Phase Unwrapping: Slices the 579-dim key back into 3 modules.
+    Finds the closest valid modulo coordinate to the previous known position,
+    completely eliminating harmonic alias "teleportation".
+    """
+    B = grid_key_flat.shape[0]
+    
+    # 1. Slice the 579-dim vector back into 121, 169, 289 arrays
+    s1, s2 = CANN_SIZES[0]**2, CANN_SIZES[1]**2
+    r1 = grid_key_flat[:, :s1].reshape(B, CANN_SIZES[0], CANN_SIZES[0])
+    r2 = grid_key_flat[:, s1:s1+s2].reshape(B, CANN_SIZES[1], CANN_SIZES[1])
+    r3 = grid_key_flat[:, s1+s2:].reshape(B, CANN_SIZES[2], CANN_SIZES[2])
+    
+    modules = [r1, r2, r3]
+    phases_x, phases_y = [], []
+    
+    # 2. Extract local phase (in meters) for each module
+    for i, (size, scale) in enumerate(zip(CANN_SIZES, WRAP_SCALES)):
+        angles = jnp.arange(size, dtype=jnp.float32) * (2 * jnp.pi / size)
+        sin_a, cos_a = jnp.sin(angles), jnp.cos(angles)
+        
+        p = modules[i] / (modules[i].sum(axis=(1, 2), keepdims=True) + 1e-8)
+        cx_angle = jnp.arctan2((p.sum(axis=1) * sin_a).sum(axis=1), (p.sum(axis=1) * cos_a).sum(axis=1)) % (2 * jnp.pi)
+        cy_angle = jnp.arctan2((p.sum(axis=2) * sin_a).sum(axis=1), (p.sum(axis=2) * cos_a).sum(axis=1)) % (2 * jnp.pi)
+        
+        phases_x.append((cx_angle / (2 * jnp.pi)) * scale)
+        phases_y.append((cy_angle / (2 * jnp.pi)) * scale)
+        
+    phases_x = jnp.stack(phases_x, axis=1) # [B, 3]
+    phases_y = jnp.stack(phases_y, axis=1)
+    
+    scale_arr = jnp.array(WRAP_SCALES)[None, :] # [1, 3]
+    
+    # 3. Local Phase Unwrapping (The Temporal Prior)
+    def unwrap_closest(phases, prior):
+        prior_exp = prior[:, None] # [B, 1]
+        # Find the shortest distance from the current phase to the expected prior phase
+        delta = phases - (prior_exp % scale_arr)
+        # Wrap delta cleanly between -scale/2 and +scale/2
+        delta_wrapped = (delta + scale_arr / 2.0) % scale_arr - scale_arr / 2.0
+        
+        # Apply the shortest path delta to the prior, and average the 3 independent pendulums
+        unwrapped_candidates = prior_exp + delta_wrapped 
+        return jnp.mean(unwrapped_candidates, axis=1) 
+
+    global_x = unwrap_closest(phases_x, prior_xy[:, 0])
+    global_y = unwrap_closest(phases_y, prior_xy[:, 1])
+    
+    return jnp.stack([global_x, global_y], axis=1)
+
+class SpikingOccupancyGrid:
+    """A 2D sheet of Leaky Integrate-and-Fire (LIF) neurons for spatial mapping."""
+    def __init__(self, map_size_m=30.0, res=0.10, offset_m=10.0, v_max=None): 
+        self.res = res
+        self.offset_m = offset_m 
+        self.grid_w = int(map_size_m / res)
+        self.grid_h = int(map_size_m / res)
+        
+        self.v_th = 1.0         
+        self.v_reset = 0.0      
+        self.v_rest = 0.0       
+        self.beta = 0.999        
+        self.w_exc = 0.35       
+        self.w_inh = -0.15      
+        self.v_max = v_max if v_max is not None else float('inf')  
+
+    def init_state(self):
+        return SpikingMapState(
+            v_mem=jnp.full((self.grid_w, self.grid_h), self.v_rest, dtype=jnp.float32),
+            spikes=jnp.zeros((self.grid_w, self.grid_h), dtype=jnp.float32)
+        )
+
+    @partial(jax.jit, static_argnames=['self'])
+    def update(self, state: SpikingMapState, hit_idx, free_idx):
+        v_next = state.v_mem * self.beta
+        
+        # Use mode='drop' to ignore our padded '-1' arrays without recompiling
+        v_next = v_next.at[free_idx[:, 0], free_idx[:, 1]].add(self.w_inh, mode='drop')
+        v_next = v_next.at[hit_idx[:, 0], hit_idx[:, 1]].add(self.w_exc, mode='drop')
+        
+        v_next = jnp.maximum(v_next, -0.5)
+        spikes = jnp.where(v_next >= self.v_th, 1.0, 0.0)
+        v_next = jnp.minimum(v_next, self.v_max)
+
+        return SpikingMapState(v_mem=v_next, spikes=spikes)
+
+def wrap_angle(theta):
+    """Keeps angles bound between -pi and pi to prevent winding spring tension."""
+    return (theta + jnp.pi) % (2 * jnp.pi) - jnp.pi
+
+@partial(jax.jit, static_argnames=['iterations'])
+def relax_graph(poses, odom_edges, odom_mask, loop_closures, loop_offsets, loop_weights, loop_mask, is_frozen, iterations=3000):
+    """
+    3DOF Force-directed graph relaxation (X, Y, Theta).
+    Now upgraded with SIMULATED ANNEALING (Dynamic Damping)!
+    """
+    k_odom_pos = 0.20
+    k_odom_th = 0.15 
+    
+    # Damping = 0.85 
+
+    velocities = jnp.zeros((poses.shape[0], 3))
+
+    def step_fn(i, state):
+        p, v = state
+        
+        # =================================================================
+        # Simulated Annealing (JAX-Safe Dynamic Damping)
+        # =================================================================
+        phase_1_end = iterations // 3        # Step 1000
+        phase_2_end = (2 * iterations) // 3  # Step 2000
+
+        dynamic_damping = jnp.where(
+            i < phase_1_end,
+            0.98,  # Phase 1 (Water): Near-frictionless. The energy wave hits Node 800 instantly!
+            jnp.where(
+                i < phase_2_end,
+                0.85,  # Phase 2 (Oil): Catch the macro-swings and stabilize the map.
+                0.60   # Phase 3 (Molasses): Aggressive freeze to lock in sub-millimeter precision.
+            )
+        )
+
+        # --- 1. Odometry Springs (SE2 Kinematics) ---
+        p_A = p[:-1]
+        p_B = p[1:]
+        
+        th_A = p_A[:, 2]
+        expected_dx = odom_edges[:, 0] * jnp.cos(th_A) - odom_edges[:, 1] * jnp.sin(th_A)
+        expected_dy = odom_edges[:, 0] * jnp.sin(th_A) + odom_edges[:, 1] * jnp.cos(th_A)
+        
+        err_x = (p_B[:, 0] - p_A[:, 0]) - expected_dx
+        err_y = (p_B[:, 1] - p_A[:, 1]) - expected_dy
+        err_th = wrap_angle((p_B[:, 2] - p_A[:, 2]) - odom_edges[:, 2])
+
+        f_x = err_x * k_odom_pos * odom_mask
+        f_y = err_y * k_odom_pos * odom_mask
+        f_th = err_th * k_odom_th * odom_mask
+
+        # The Lever Arm Effect!
+        # Torque = r x F = (expected_dx * f_y) - (expected_dy * f_x)
+        # We multiply by 0.25 to heavily dampen the torque and prevent Euler explosion
+        torque_A = (expected_dx * f_y - expected_dy * f_x) * 0.25 * odom_mask
+
+        # Apply translational forces exactly as before
+        dp_odom_x = jnp.pad(f_x, (0, 1)) + jnp.pad(-f_x, (1, 0))
+        dp_odom_y = jnp.pad(f_y, (0, 1)) + jnp.pad(-f_y, (1, 0))
+
+        # apply the torque
+        # Node B receives standard IMU rotational correction (-f_th)
+        # Node A receives standard IMU correction (+f_th) PLUS the physical lever arm torque!
+        dp_odom_th_A = f_th + torque_A
+        dp_odom_th_B = -f_th
+        dp_odom_th = jnp.pad(dp_odom_th_A, (0, 1)) + jnp.pad(dp_odom_th_B, (1, 0))
+
+        # --- 2. Loop Closure Springs ---
+        lc_A = p[loop_closures[:, 0]]
+        lc_B = p[loop_closures[:, 1]]
+        
+        # Apply Relative Transforms (Offsets)
+        th_A_lc = lc_A[:, 2]
+        expected_lc_dx = loop_offsets[:, 0] * jnp.cos(th_A_lc) - loop_offsets[:, 1] * jnp.sin(th_A_lc)
+        expected_lc_dy = loop_offsets[:, 0] * jnp.sin(th_A_lc) + loop_offsets[:, 1] * jnp.cos(th_A_lc)
+
+        lc_err_x = (lc_B[:, 0] - lc_A[:, 0] - expected_lc_dx) * loop_mask
+        lc_err_y = (lc_B[:, 1] - lc_A[:, 1] - expected_lc_dy) * loop_mask
+        lc_err_th = wrap_angle((lc_B[:, 2] - lc_A[:, 2]) - loop_offsets[:, 2]) * loop_mask
+
+        # Dynamic Covariance Scaling (DCS) — SOTA outlier rejection!
+        # (Agarwal, Olson, Stachniss, 2013)
+        # Automatically downweights false loop closures based on residual magnitude.
+        # A correct LC has small residual → dcs_weight ≈ 1.0 (full force)
+        # A false LC has large residual → dcs_weight → 0.0 (neutralized)
+        dcs_phi = 0.5  # Kernel width — smaller = more aggressive outlier rejection
+        residual_sq = lc_err_x**2 + lc_err_y**2 + lc_err_th**2
+        dcs_weight = dcs_phi / (dcs_phi + residual_sq)
+
+        # Apply Biological Confidence Weights × DCS Robust Kernel
+        lc_f_x = lc_err_x * loop_weights[:, 0] * dcs_weight
+        lc_f_y = lc_err_y * loop_weights[:, 0] * dcs_weight
+        lc_f_th = lc_err_th * loop_weights[:, 1] * dcs_weight
+
+        # Accumulate forces
+        dp_loop_x = jax.ops.segment_sum(lc_f_x, loop_closures[:, 0], num_segments=p.shape[0]) - \
+                    jax.ops.segment_sum(lc_f_x, loop_closures[:, 1], num_segments=p.shape[0])
+        dp_loop_y = jax.ops.segment_sum(lc_f_y, loop_closures[:, 0], num_segments=p.shape[0]) - \
+                    jax.ops.segment_sum(lc_f_y, loop_closures[:, 1], num_segments=p.shape[0])
+        dp_loop_th = jax.ops.segment_sum(lc_f_th, loop_closures[:, 0], num_segments=p.shape[0]) - \
+                     jax.ops.segment_sum(lc_f_th, loop_closures[:, 1], num_segments=p.shape[0])
+
+        # Clip the max velocity step to guarantee Euler stability!
+        dp_loop_x = jnp.clip(dp_loop_x, -0.10, 0.10)
+        dp_loop_y = jnp.clip(dp_loop_y, -0.10, 0.10)
+        dp_loop_th = jnp.clip(dp_loop_th, -0.05, 0.05)
+
+        # --- 3. Integrate Kinematics ---
+        # Hard Clamp the Integration Velocity
+        v_new_x = jnp.clip((v[:, 0] + dp_odom_x + dp_loop_x) * dynamic_damping, -0.05, 0.05)
+        v_new_y = jnp.clip((v[:, 1] + dp_odom_y + dp_loop_y) * dynamic_damping, -0.05, 0.05)
+        v_new_th = jnp.clip((v[:, 2] + dp_odom_th + dp_loop_th) * dynamic_damping, -0.02, 0.02)
+
+        p_new_x = p[:, 0] + v_new_x
+        p_new_y = p[:, 1] + v_new_y
+        p_new_th = wrap_angle(p[:, 2] + v_new_th)
+
+        p_new_x = jnp.where(is_frozen, poses[:, 0], p_new_x)
+        p_new_y = jnp.where(is_frozen, poses[:, 1], p_new_y)
+        p_new_th = jnp.where(is_frozen, poses[:, 2], p_new_th)
+
+        v_new_x = jnp.where(is_frozen, 0.0, v_new_x)
+        v_new_y = jnp.where(is_frozen, 0.0, v_new_y)
+        v_new_th = jnp.where(is_frozen, 0.0, v_new_th)
+
+        p_new = jnp.stack([p_new_x, p_new_y, p_new_th], axis=1)
+        v_new = jnp.stack([v_new_x, v_new_y, v_new_th], axis=1)
+
+        return (p_new, v_new)
+
+    final_p, final_v = jax.lax.fori_loop(0, iterations, step_fn, (poses, velocities))
+    return final_p
+
+# ============================================================================
+#  🌊 SOTA EVENT-CAMERA MENTAL ROTATION (PHASE CORRELATION)
+# ============================================================================
+@jax.jit
+def get_phase_correlation(live_csnn, mem_csnn):
+    """
+    Computes scale/contrast-invariant correlation using 1D Phase Correlation.
+    Upgraded to LINEAR Phase Correlation via Zero-Padding (2N) to prevent 
+    circular wrap-around without destroying edge features.
+    """
+    N = live_csnn.shape[-1]
+    
+    # Zero-pad to 2N
+    # Creates "empty space" so the shifted features don't wrap around,
+    # completely eliminating the need for a feature-destroying Hanning window!
+    pad_width = [(0, 0)] * (live_csnn.ndim - 1) + [(0, N)]
+    
+    live_padded = jnp.pad(live_csnn, pad_width)
+    mem_padded = jnp.pad(mem_csnn, pad_width)
+    
+    # Transform to Frequency Domain
+    F_live = jnp.fft.fft(live_padded)
+    F_mem = jnp.fft.fft(mem_padded)
+    
+    # Calculate the Cross-Power Spectrum (Mem * conj(Live))
+    cross_power = F_mem * jnp.conj(F_live)
+    
+    # Normalize by magnitude to extract pure Phase
+    cross_power_norm = cross_power / (jnp.abs(cross_power) + 1e-8)
+    
+    # Inverse FFT back to Spatial Domain
+    r = jnp.fft.ifft(cross_power_norm)
+    return jnp.abs(r)
+
+
+@jax.jit
+def get_dvs_rotation_shift(curr_ts, prev_ts):
+    """
+    Computes visual rotation shift and Peak-to-Sidelobe Ratio (PSR) confidence
+    between consecutive time surfaces using 1D phase correlation.
+    """
+    curr_on = curr_ts[:, :N_PIXELS]
+    curr_off = curr_ts[:, N_PIXELS:]
+    prev_on = prev_ts[:, :N_PIXELS]
+    prev_off = prev_ts[:, N_PIXELS:]
+    
+    r_on = get_phase_correlation(curr_on, prev_on)
+    r_off = get_phase_correlation(curr_off, prev_off)
+    r_real = r_on + r_off
+    
+    N_PAD = N_PIXELS * 2
+    search_radius = 15
+    
+    idx = jnp.arange(N_PAD)
+    mask = (idx <= search_radius) | (idx >= N_PAD - search_radius)
+    r_masked = jnp.where(mask[None, :], r_real, -1e9)
+    
+    peak_idx = jnp.argmax(r_masked, axis=1)
+    
+    y2 = jnp.take_along_axis(r_real, peak_idx[:, None], axis=1)[:, 0]
+    y1 = jnp.take_along_axis(r_real, ((peak_idx - 1) % N_PAD)[:, None], axis=1)[:, 0]
+    y3 = jnp.take_along_axis(r_real, ((peak_idx + 1) % N_PAD)[:, None], axis=1)[:, 0]
+    
+    denom = 2.0 * (y1 - 2.0 * y2 + y3)
+    sub_pixel_offset = jnp.clip((y1 - y3) / (denom - 1e-8), -1.0, 1.0)
+    
+    shift_int = jnp.where(peak_idx <= search_radius, peak_idx, peak_idx - N_PAD)
+    pixel_shift = shift_int + sub_pixel_offset
+    
+    pixel_ang_res = jnp.radians(FOV_DEG) / N_PIXELS
+    sub_pixel_th = -pixel_shift * pixel_ang_res
+    
+    # Calculate PSR (Peak-to-Sidelobe Ratio) as confidence
+    mean_val = jnp.mean(r_real, axis=1)
+    psr = y2 / (mean_val + 1e-8)
+    
+    return sub_pixel_th, psr
+
+
+# ============================================================================
+#  ⚖️ SOTA GAUGE ALIGNMENT (UMEYAMA'S ALGORITHM)
+# ============================================================================
+
+def get_optimal_alignment_2d(P_est, P_gt):
+    """
+    Computes the optimal rotation (R) and translation (t) to align P_est to P_gt.
+    Uses Umeyama's algorithm (SVD) to eliminate Gauge Freedom / unobservable drift.
+    """
+    if len(P_est) < 5:
+        return np.eye(2), np.zeros(2)
+
+    # 1. Find centroids
+    mu_est = np.mean(P_est, axis=0)
+    mu_gt = np.mean(P_gt, axis=0)
+
+    # 2. Center the points
+    P_est_c = P_est - mu_est
+    P_gt_c = P_gt - mu_gt
+
+    # 3. Calculate Covariance Matrix & SVD
+    H = P_est_c.T @ P_gt_c
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # 4. Handle reflection (ensure it's a pure rotation)
+    if np.linalg.det(R) < 0:
+        Vt[1, :] *= -1
+        R = Vt.T @ U.T
+
+    # 5. Calculate final translation
+    t = mu_gt - R @ mu_est
+    return R, t
+
+
+# ============================================================================
+#  🌍 INFINITE LIVE ENVIRONMENT
+# ============================================================================
+class LiveEnvironment:
+    def __init__(self, key, chunk_size=2000, course_type='random'):
+        self.key = key
+        self.chunk_size = chunk_size
+        self.course_type = course_type   # 'random' (default) or 'circuit' (revisit-rich, Part B)
+        self.obstacles = None
+        self.generate_new_chunk()
+
+    def generate_new_chunk(self):
+        self.key, subkey = random.split(self.key)
+        events, labels, tof_dists, positions, headings, obs, segments, intensities = \
+            generate_fixed_room_dataset(subkey, 1, time_steps=self.chunk_size,
+                                        obstacles=self.obstacles, course_type=self.course_type)
+        
+        self.obstacles = np.array(obs)
+        self.ev = np.array(events[0])
+        kin3 = np.array(jnp.stack([labels[0, :, 0] * abs(VX_RANGE[1]),
+                                   labels[0, :, 1] * abs(VY_RANGE[1]),
+                                   labels[0, :, 2] * abs(OMEGA_RANGE[1])], axis=1))
+        self.tof = np.array(tof_dists[0])
+        self.pos = np.array(positions[0, :, :2])
+        self.th = np.array(headings[0])
+        self.intensities = np.array(intensities[0])
+
+        # --- Synthesize a proper-acceleration accelerometer (vertical-plane / pitch model) ---
+        # The body attitude theta is a pitch in a sagittal (forward x, vertical z) plane, so
+        # gravity provides a genuine absolute reference. The body-frame proper acceleration is
+        #   a_proper = R(theta)^T (a_world + [0, g]),   g = 9.81 along the vertical (z) axis,
+        # giving arctan2(ax, az) = theta at low linear acceleration -- the signal the spiking
+        # complementary filter fuses with the (drift-prone) gyro to anchor the ring attractor.
+        G = 9.81
+        pw = self.pos.astype(np.float32)
+        N = pw.shape[0]
+        aw = np.zeros((N, 2), dtype=np.float32)
+        if N > 2:
+            aw[1:-1] = (pw[2:] - 2.0 * pw[1:-1] + pw[:-2]) / (DT ** 2)   # world linear accel
+        th = self.th.astype(np.float32)
+        c, s = np.cos(th), np.sin(th)
+        gx = aw[:, 0]
+        gz = aw[:, 1] + G                                                # gravity on the vertical axis
+        ax = c * gx + s * gz
+        az = -s * gx + c * gz
+        seed_acc = int(random.randint(subkey, (), 0, 2**31 - 1))
+        rng_acc = np.random.RandomState(seed_acc)
+        ACC_MEMS_NOISE = 0.05                                            # m/s^2 white MEMS noise (S2 adds 115 Hz vibration)
+        ax = ax + rng_acc.normal(0.0, ACC_MEMS_NOISE, N).astype(np.float32)
+        az = az + rng_acc.normal(0.0, ACC_MEMS_NOISE, N).astype(np.float32)
+
+        # --- optional deterministic MEMS accelerometer errors (bias / scale-factor / misalignment) ---
+        # Off by default so v1 results are unchanged; enable with ACC_BIAS_STD etc.
+        # A constant bias b appears to a gravity-referenced tilt estimator as an apparent tilt of
+        # ~b/g rad (0.1 m/s^2 -> ~0.6 deg), so this is the idealisation that most flatters the anchor.
+        _b_std  = float(os.environ.get('ACC_BIAS_STD',  '0.0'))   # m/s^2, per-trial constant, per axis
+        _sf_std = float(os.environ.get('ACC_SF_STD',    '0.0'))   # fractional scale-factor error
+        _ma_std = float(os.environ.get('ACC_MISALIGN',  '0.0'))   # rad, x/z axis non-orthogonality
+        if _b_std or _sf_std or _ma_std:
+            _bfix = os.environ.get('ACC_BIAS_FIXED')
+            if _bfix is not None:
+                bx, bz = float(_bfix), 0.0          # deterministic, for dose-response testing
+            else:
+                bx, bz = rng_acc.normal(0.0, _b_std, 2) if _b_std else (0.0, 0.0)
+            sx, sz = (1.0 + rng_acc.normal(0.0, _sf_std, 2)) if _sf_std else (1.0, 1.0)
+            eps = rng_acc.normal(0.0, _ma_std) if _ma_std else 0.0
+            ax_c = sx * (ax + eps * az) + bx
+            az_c = sz * (az - eps * ax) + bz
+            ax, az = ax_c.astype(np.float32), az_c.astype(np.float32)
+
+        # --- S2: wingbeat vibration on the IMU (gyro + accelerometer) ---
+        # The flapping wingbeat (~115 Hz) mechanically shakes the IMU. The IMU samples at its
+        # own hardware rate (IMU_OVERSAMPLE/DT = 1 kHz), where the wingbeat is properly
+        # represented -- it is NOT aliased. The estimator consumes the MEAN over each 20 ms step
+        # (what integrating the IMU at its native rate yields), so the zero-mean tone is
+        # attenuated by |sinc(f*DT)| = 0.112 at 115 Hz. See imu_rate_average() (Methods).
+        if VIB_ENABLE:
+            vib_g = imu_rate_average(VIB_FREQ, VIB_GYRO_AMP, DT, N)                 # gyro (rad/s)
+            vib_ax = imu_rate_average(VIB_FREQ, VIB_ACC_AMP, DT, N)                 # accel x
+            vib_az = imu_rate_average(VIB_FREQ, VIB_ACC_AMP, DT, N, phase0=np.pi / 2)  # accel z (cos)
+            kin3[:, 2] = kin3[:, 2] + vib_g.astype(np.float32)
+            ax = ax + vib_ax.astype(np.float32)
+            az = az + vib_az.astype(np.float32)
+
+        # --- B-S1: realistic MEMS gyro drift (constant per-trial bias + rate random-walk) ---
+        # Injected only on the gyro (the accelerometer remains a clean absolute attitude
+        # reference), so dead-reckoning drifts while the gravity anchor / loop closure can
+        # correct it. Seeded per chunk for reproducibility.
+        self.key, subkey_gyro = random.split(self.key)
+        seed_gyro = int(random.randint(subkey_gyro, (), 0, 2**31 - 1))
+        rng_gyro = np.random.RandomState(seed_gyro)
+        gyro_bias = float(rng_gyro.normal(0.0, GYRO_BIAS_STD))
+        gyro_rw = np.cumsum(rng_gyro.normal(0.0, GYRO_RW_SIGMA, N)).astype(np.float32)
+        kin3[:, 2] = kin3[:, 2] + gyro_bias + gyro_rw
+
+        # --- 6.1: realistic event+ToF VO velocity-error model on [vx, vy] ---
+        # Applied AFTER the accelerometer synthesis inputs (acc is built from true position +
+        # attitude, not from vx/vy), so the gravity/attitude reference stays clean and this
+        # perturbs only the translational velocity that drives position path-integration.
+        # Seeded per chunk from the JAX key stream (after the gyro split, so gyro/acc noise is
+        # unchanged) -> reproducible and identical across the IMU / anchor-off / anchor-on paths.
+        if VO_NOISE_ENABLE:
+            self.key, subkey_vo = random.split(self.key)
+            seed_vo = int(random.randint(subkey_vo, (), 0, 2**31 - 1))
+            rng_vo = np.random.RandomState(seed_vo)
+            v_body = kin3[:, :2].astype(np.float64)
+            speed_rms = float(np.sqrt(np.mean(v_body[:, 0] ** 2 + v_body[:, 1] ** 2))) + 1e-9
+            scale = 1.0 + rng_vo.normal(0.0, VO_SCALE_STD)                       # per-trial metric-scale bias
+            mag = 1.0 + rng_vo.normal(0.0, VO_MAG_REL, N)                        # per-step relative magnitude noise
+            dth = rng_vo.normal(0.0, VO_DIR_STD, N)                             # per-step direction noise (rad)
+            bias0 = rng_vo.normal(0.0, VO_BIAS_REL * speed_rms, 2)             # per-trial constant velocity bias
+            bias_rw = np.cumsum(rng_vo.normal(0.0, VO_BIAS_RW_REL * speed_rms, (N, 2)), axis=0)  # slow bias drift
+            cd, sd = np.cos(dth), np.sin(dth)
+            vx_r = cd * v_body[:, 0] - sd * v_body[:, 1]                        # rotate by direction noise
+            vy_r = sd * v_body[:, 0] + cd * v_body[:, 1]
+            kin3[:, 0] = (scale * mag * vx_r + bias0[0] + bias_rw[:, 0]).astype(np.float32)
+            kin3[:, 1] = (scale * mag * vy_r + bias0[1] + bias_rw[:, 1]).astype(np.float32)
+
+        acc = np.stack([ax, az], axis=1).astype(np.float32)
+        # kin now carries [vx, vy, omega, ax, az]; forward_step reads acc from columns 3:5.
+        self.kin = np.concatenate([kin3, acc], axis=1).astype(np.float32)
+        self.t = 0
+
+    def step(self):
+        if self.t >= self.chunk_size:
+            print("\n 🔄 Robot reached end of planned trajectory. Generating next path chunk...")
+            self.generate_new_chunk()
+            
+        frame = (self.ev[self.t], self.kin[self.t], self.tof[self.t], 
+                 self.pos[self.t], self.th[self.t], self.intensities[self.t])
+        self.t += 1
+        return frame
+
+
+# ============================================================================
+#  🧠  MASTER SYSTEM CLASS
+# ============================================================================
+
+class SNNSLAMSystem:
+    def __init__(self, key, n_depth=N_DEPTH):
+        self.n_depth = n_depth
+
+        # Build LISTS of weight matrices for the 3 spatial modules!
+        W_cann_list = [build_2d_cann_weights(size) for size in CANN_SIZES]
+        W_cann_asym_x_list = [build_asymmetric_cann_weights_x(size) for size in CANN_SIZES]
+        W_cann_asym_y_list = [build_asymmetric_cann_weights_y(size) for size in CANN_SIZES]
+        
+        # The Ring Attractor heading circuit stays single-scale!
+        W_ring        = build_1d_ring_weights()
+        W_ring_asym   = build_asymmetric_ring_weights()
+
+        k_vision, key = random.split(key)
+        self.vision = DualStreamVisionCortex(k_vision, n_pixels=N_PIXELS)
+
+        self.tof_coder = ToFPopulationCoder(n_depth_per_ray=self.n_depth // 3)
+
+        k_pose, key = random.split(key)
+        # Pass the lists into PoseCANN instead of a single matrix
+        self.pose = PoseCANN(k_pose, W_cann_list, W_ring,
+                              W_cann_asym_x_list, W_cann_asym_y_list, W_ring_asym)
+
+        # Pass the FlyHash config into the brain!
+        k_place, key = random.split(key)
+        self.place = PlaceCellNetwork(
+            key=k_place, 
+            n_csnn=256, 
+            n_stdp=256, 
+            n_depth=self.n_depth, 
+            fov_deg=FOV_DEG,
+            n_place=FLYHASH_CONFIG["num_bits"],        # 256 place cells (FLYHASH_CONFIG num_bits)
+            k_spikes=FLYHASH_CONFIG["active_spikes_k"] # 8 active bits
+        )
+
+        self.vision_state = None
+        self.place_state = None
+        self._initialized = False
+        self._step = 0
+        
+        # The Cerebellum's internal calibration model
+        self.learned_omega_bias = 0.0
+        self.last_decoded_xy = None   # temporal anchor for phase unwrapping
+        self.prev_decoded_xy = None   # one step earlier — used for linear extrapolation
+        self.prev_time_surface = None # previous event time surface for visual odometry
+
+        # Configurable parameters for sensory pre-processing and fusion (Optimized Set)
+        self.v_x_scale = 0.01000
+        self.v_z_scale = 0.22070
+        self.psr_thresh = 4.49000
+        self.psr_range = 4.84275
+        self.vis_act_thresh = 0.01154
+        # Complementary-filter accelerometer-correction gain (single source of truth: ALPHA_FUSE).
+        # new = (1-a)*gyro + a*accel; a=0.02 keeps the gyro for high-frequency motion while the
+        # gravity (accel) estimate corrects low-frequency drift -- 0.98 gyro / 0.02 accel.
+        self.alpha_fuse = ALPHA_FUSE
+        self.alpha_acc = 0.18630   # EMA low-pass on raw accel to suppress wingbeat vibration
+        self._smooth_omega = None
+
+    def reset(self, B):
+        self.vision_state = self.vision.init_state(B)
+        self.place_state = self.place.init_state(B)
+        self.pose.reset(B)
+        self._initialized = False
+        self._step = 0
+        self.last_decoded_xy = None
+        self.prev_decoded_xy = None
+        self.prev_time_surface = None
+        self._theta_gravity = jnp.zeros((B,))
+        self._smooth_acc = None
+        self._smooth_omega = None
+
+    def reset_pose_only(self, B):
+        """NEW: Resets active pose tracker and temporal traces on crash, but PRESERVES the learned Hebbian map weights (W_seq_to_place, etc.)."""
+        if self.place_state is not None:
+            self.place_state = self.place_state._replace(
+                trace_csnn=jnp.zeros_like(self.place_state.trace_csnn),
+                trace_stdp=jnp.zeros_like(self.place_state.trace_stdp),
+                trace_tof=jnp.zeros_like(self.place_state.trace_tof),
+                trace_place=jnp.zeros_like(self.place_state.trace_place),
+                trace_ring=jnp.zeros_like(self.place_state.trace_ring),
+                confidence_counter=jnp.zeros_like(self.place_state.confidence_counter)
+            )
+        else:
+            self.place_state = self.place.init_state(B)
+
+        self.vision_state = self.vision.init_state(B)
+        self.pose.reset(B)
+        self._initialized = False
+        self._step = 0
+        self.last_decoded_xy = None
+        self.prev_decoded_xy = None
+        self.prev_time_surface = None
+        self._theta_gravity = jnp.zeros((B,))
+        self._smooth_acc = None
+        self._smooth_omega = None
+
+    def inject_stdp_memory(self, recovered_stdp_weights):
+        """NEW: Overwrites the live working memory with the episodic Hash Map snapshot."""
+        new_stdp_state = self.vision_state.stdp_state._replace(W=recovered_stdp_weights)
+        self.vision_state = self.vision_state._replace(stdp_state=new_stdp_state)
+
+    def initialize_pose(self, gt_pos, gt_heading):
+        self.pose.initialize_pose(gt_pos, gt_heading)
+        pose_bump = self.pose.get_state_flat()
+        ring_bump = self.pose.get_ring_activity()
+        self.place_state = self.place.initialize_from_pose(self.place_state, pose_bump, ring_bump=ring_bump)
+        self.last_decoded_xy = gt_pos[:, :2]
+        self.prev_decoded_xy = gt_pos[:, :2]  # bootstrap: prev == last so first-frame step = 0
+        self._theta_gravity = gt_heading
+        self._smooth_acc = None
+        self._initialized = True
+
+    def calibrate_cerebellum(self, accumulated_error_rads, time_elapsed_sec):
+        """Phase 3 Plasticity: Learn the systematic hardware drift!"""
+        if time_elapsed_sec <= 0: return
+        
+        # Calculate the drift rate in rad/s
+        drift_rate = accumulated_error_rads / time_elapsed_sec
+        
+        # Gentle Hebbian update (EMA) to prevent overreacting to one noisy loop closure
+        learning_rate = 0.05
+        self.learned_omega_bias = (1.0 - learning_rate) * self.learned_omega_bias + (learning_rate * drift_rate)
+
+    def phase_perception(self, events_t, tof_t, learn=True):
+        self.vision_state, dual_vis_features = self.vision(self.vision_state, events_t, tof_t[:, 1], learn=learn)
+        tof_pop = self.tof_coder(tof_t)
+        return dual_vis_features, tof_pop
+
+    def phase_inference(self, dual_vis_features, tof_features, pose_bump, current_heading_rads, ring_bump): 
+        vis_csnn, vis_stdp = dual_vis_features
+        self.place_state, is_confident, peak_idx_place, debug_gates = self.place.compute_confidence_with_gates(
+            self.place_state, vis_csnn, vis_stdp, tof_features, pose_bump, current_heading_rads, ring_bump 
+        )
+        return is_confident, peak_idx_place, debug_gates
+
+    def phase_odometry(self, kin_t, events_t=None, tof_t=None, theta_gravity=None, inject_drift=False, dt=DT):
+        # Subtract the learned bias from the raw hardware!
+        corrected_omega = kin_t[:, 2] - self.learned_omega_bias
+        
+        # DVS Visual Odometry: calculate relative rotation shift using SOTA phase correlation
+        # on the spatial time surface between consecutive frames.
+        curr_ts = self.vision_state.time_surface
+        
+        B = kin_t.shape[0]
+        if self.prev_time_surface is not None:
+            # Grab current visual activity level from vis_csnn
+            csnn_clean = jnp.maximum(0.0, self.vision_state.csnn_trace)
+            vis_csnn = csnn_clean / (jnp.linalg.norm(csnn_clean, axis=-1, keepdims=True) + 1e-8)
+            top16_vis = jnp.sort(vis_csnn, axis=1)[:, -16:]
+            vis_act = jnp.mean(top16_vis, axis=1)
+            
+            # Compute phase correlation, sub-pixel shift, and peak PSR confidence
+            sub_pixel_th, psr = get_dvs_rotation_shift(curr_ts, self.prev_time_surface)
+            omega_vis = jnp.clip(sub_pixel_th / dt, -6.0, 6.0)
+            
+            # Calculate dynamic blending weight based on PSR confidence
+            vis_trust_raw = jnp.clip((psr - self.psr_thresh) / self.psr_range, 0.0, 1.0)
+            vis_trust = jnp.where(vis_act >= self.vis_act_thresh, vis_trust_raw, 0.0)
+        else:
+            omega_vis = jnp.zeros((B,))
+            vis_trust = jnp.zeros((B,))
+            
+        self.prev_time_surface = curr_ts
+        
+        # Compute visual translation velocity [vx_vis, vz_vis] from Event-rate * ToF distance
+        if events_t is not None and tof_t is not None:
+            events_left = events_t[:, :128]
+            events_right = events_t[:, 128:]
+            
+            F_left = jnp.mean(jnp.abs(events_left), axis=1)
+            F_right = jnp.mean(jnp.abs(events_right), axis=1)
+            
+            d_left = tof_t[:, 0]
+            d_right = tof_t[:, 2]
+            
+            v_x_vis = self.v_x_scale * (F_left * d_left + F_right * d_right)
+            v_z_vis = self.v_z_scale * jnp.abs(F_left * d_left - F_right * d_right)
+            
+            # Sign the visual velocities according to the IMU velocities to prevent opposite-current conflicts!
+            v_x_vis = jnp.sign(kin_t[:, 0]) * v_x_vis
+            v_z_vis = jnp.sign(kin_t[:, 1]) * v_z_vis
+            
+            v_vis_trans = jnp.stack([v_x_vis, v_z_vis], axis=1)
+        else:
+            v_vis_trans = jnp.zeros((B, 2))
+            
+        # No pre-blending of corrected_omega here!
+        kin_corrected = jnp.stack([kin_t[:, 0], kin_t[:, 1], corrected_omega], axis=1)
+
+        if inject_drift:
+            # We inject the factory drift onto the CORRECTED signal
+            omega_drift = kin_corrected[:, 2] + DRIFT_OMEGA
+            kin_injected = jnp.stack([kin_corrected[:, 0], kin_corrected[:, 1], omega_drift], axis=1)
+        else:
+            kin_injected = kin_corrected
+
+        # Capture the pre-update heading so the predicted displacement is in the
+        # correct global frame (matches what the CANN __call__ uses internally).
+        theta_pre = self.pose.estimate_heading()  # ring readout BEFORE CANN update
+
+        # Pass visual inputs directly into PoseCANN for direct current injection
+        pose_est = self.pose(
+            kin_injected,
+            omega_vis=omega_vis,
+            vis_trust=vis_trust,
+            v_vis_trans=v_vis_trans,
+            theta_gravity=theta_gravity,
+            dt=dt
+        )
+        
+        # Grab the raw 579-dim Grid Key and decode it!
+        pose_bump = self.pose.get_state_flat()
+        
+        predicted_xy = self.last_decoded_xy  # Zero-extrapolation prior (prevents turn/drift divergence)
+        
+        decoded_xy = decode_grid_to_xy(pose_bump, predicted_xy)
+        
+        # Advance the two-frame history (kept for cerebellum velocity computation)
+        self.prev_decoded_xy = self.last_decoded_xy
+        self.last_decoded_xy = decoded_xy
+        
+        # Update Cerebellum with separate IMU and Vision parameters
+        self.pose.update_cerebellum(
+            kin_injected,
+            decoded_xy,
+            pose_est[:, 2],
+            omega_vis=omega_vis,
+            vis_trust=vis_trust,
+            v_vis_trans=v_vis_trans,
+            dt=dt
+        )
+
+        ring_bump = self.pose.get_ring_activity()
+        
+        # Replace the "dummy" CANN output with our beautifully unwrapped coordinates!
+        final_pose_est = jnp.stack([decoded_xy[:, 0], decoded_xy[:, 1], pose_est[:, 2]], axis=1)
+        
+        return final_pose_est, pose_bump, ring_bump
+
+    # Add 'heading' to the signature
+    def phase_mapping(self, dual_vis_features, tof_features, pose_bump, ring_bump, heading, angular_vel, confidence=None):
+        vis_csnn, vis_stdp = dual_vis_features
+        
+        self.place_state, (r_place, r_ring) = self.place.forward_mapping(
+            self.place_state, vis_csnn, vis_stdp, tof_features, pose_bump, ring_bump=ring_bump, heading=heading, angular_vel=angular_vel, learn=True, confidence=confidence
+        )
+        
+        return r_place, r_ring
+
+    def forward_step(self, events_t, kin_t, tof_t, acc_t=None, inject_drift=False, autopilot_on=True, dt=DT):
+        # Accelerometer is carried in kin columns 3:5 ([vx, vy, omega, ax, az]); extract it so
+        # the spiking complementary gravity filter runs (closed-loop / anchored configuration).
+        if acc_t is None and kin_t.shape[1] >= 5:
+            acc_t = kin_t[:, 3:5]
+        # Gate STDP learning by kinematic stability (angular velocity) to prevent learning visual noise during fast spins/crashes
+        # Low-pass filter the raw angular velocity to smooth out flapping-wing vibrations (115 Hz)
+        if self._smooth_omega is None or self._smooth_omega.shape[0] != kin_t.shape[0]:
+            self._smooth_omega = jnp.zeros_like(kin_t[:, 2])
+        else:
+            alpha_omega = 0.3
+            self._smooth_omega = (1.0 - alpha_omega) * self._smooth_omega + alpha_omega * kin_t[:, 2]
+
+        is_stable = jnp.abs(self._smooth_omega) < self.place.dynamic_saccade_thresh
+        learn_gate = autopilot_on & is_stable[0]
+        dual_vis_features, tof_features = self.phase_perception(events_t, tof_t, learn=learn_gate)
+
+        # Decode the Grid Key instead of calling estimate_position
+        pose_bump_prior = self.pose.get_state_flat()
+        pose_xy = decode_grid_to_xy(pose_bump_prior, self.last_decoded_xy)
+        
+        current_heading_rads = self.pose.estimate_heading()
+        
+        # Grab the CANN belief BEFORE inference
+        ring_bump_prior = self.pose.get_ring_activity()
+
+        is_confident, peak_idx_place, debug_gates = self.phase_inference(
+            dual_vis_features, tof_features, pose_bump_prior, current_heading_rads, ring_bump_prior # changed
+        )
+
+        # Complementary Filter state estimator for gravity direction (pitch correction)
+        if acc_t is not None:
+            # 1. Low-pass filter the accelerometer readings (EMA) to suppress high-frequency flapping vibration
+            alpha_acc = self.alpha_acc
+            if self._smooth_acc is None or self._smooth_acc.shape[0] != acc_t.shape[0]:
+                self._smooth_acc = acc_t
+            else:
+                self._smooth_acc = (1.0 - alpha_acc) * self._smooth_acc + alpha_acc * acc_t
+            
+            # 2. Extract pitch angle from proper acceleration (acc_x, acc_z)
+            ax = self._smooth_acc[:, 0]
+            az = self._smooth_acc[:, 1]
+            # Extract the absolute pitch from the (low-passed) proper acceleration.
+            theta_accel = wrap_angle(jnp.arctan2(ax, az))
+            
+            # 3. Integrate gyroscope rate (corrected for learned bias)
+            corrected_omega = kin_t[:, 2] - self.learned_omega_bias
+            theta_gyro = self._theta_gravity + corrected_omega * dt
+            theta_gyro = wrap_angle(theta_gyro)
+            
+            # 4. Fuse using Complementary Filter
+            alpha_fuse = self.alpha_fuse
+            diff = wrap_angle(theta_accel - theta_gyro)
+            self._theta_gravity = wrap_angle(theta_gyro + alpha_fuse * diff)
+            
+            theta_gravity_val = self._theta_gravity
+        else:
+            theta_gravity_val = None
+
+        pose_est, pose_bump, ring_bump = self.phase_odometry(
+            kin_t,
+            events_t=events_t,
+            tof_t=tof_t,
+            theta_gravity=theta_gravity_val,
+            inject_drift=inject_drift,
+            dt=dt
+        )
+        
+        # Update last_decoded_xy so the next frame unwraps around the NEW position!
+        self.last_decoded_xy = pose_est[:, :2]
+
+        # Pass the continuous heading (pose_est[:, 2]) into the mapping phase!
+        r_place, r_ring = self.phase_mapping(dual_vis_features, tof_features, pose_bump, ring_bump, pose_est[:, 2], self._smooth_omega, confidence=None)
+
+        debug_gates = {**debug_gates, "Smooth_Omega": self._smooth_omega, "Learn_Gate": learn_gate}
+
+        self._step += 1
+        return pose_est, r_place, r_ring, is_confident, peak_idx_place, debug_gates
+
+    def forward_step_open_loop(self, events_t, kin_t, tof_t, inject_drift=False, dt=DT):
+        dual_vis_features, tof_features = self.phase_perception(events_t, tof_t)
+
+        pose_est, pose_bump, ring_bump = self.phase_odometry(
+            kin_t,
+            events_t=events_t,
+            tof_t=tof_t,
+            inject_drift=inject_drift,
+            dt=dt
+        )
+
+        self._step += 1
+        return pose_est, None, None
+
+# ============================================================================
+#  🎨  4-PANEL VISUALIZATION
+# ============================================================================
+
+def visualize_4panel(results, save_path=None, ev_save_path=None):
+    B = results['B']
+    # Measure the actual array length in case of Ctrl+C mismatch!
+    T = results['x_gt'].shape[1]
+    n_show = min(N_TRAJ_SHOW, B)
+    ds = results['drift_start']
+    ev_shape = results.get('ev_shape', (B, T, N_PIXELS))
+    N_PIX = ev_shape[2]
+
+    gt_colors = plt.cm.Blues(np.linspace(0.5, 0.9, n_show))
+    imu_color  = '#E74C3C'  
+    ol_color   = '#E67E22'  
+    cl_color   = '#27AE60'  
+    pc_star_c  = '#9B59B6'  
+
+    t_arr = np.arange(T) * DT
+    fig = plt.figure(figsize=(24, 7))
+
+    from matplotlib.gridspec import GridSpec
+    gs = GridSpec(1, 4, figure=fig, wspace=0.35, left=0.04, right=0.98, top=0.90, bottom=0.14)
+
+    # ── Panel 1: IMU-only ──────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    _draw_room(ax1, results['obstacles'])
+    for i in range(n_show):
+        ax1.plot(results['x_gt'][i, ::4], results['y_gt'][i, ::4], 'o-', color=gt_colors[i], ms=3, lw=1.5, alpha=0.7, label=f'GT {i}' if i == 0 else None)
+        ax1.plot(results['x_imu'][i, ::4], results['y_imu'][i, ::4], 's--', color=imu_color, ms=3, lw=2.0, alpha=0.85, label=f'IMU-only {i}' if i == 0 else None)
+        ax1.plot(results['x_gt'][i, 0], results['y_gt'][i, 0], 'D', color='lime', ms=10, zorder=10)
+        ax1.plot(results['x_imu'][i, 0], results['y_imu'][i, 0], 'X', color=imu_color, ms=10, zorder=10)
+
+    ax1.set_title('Panel 1: IMU-Only\n(Pure velocity integration — no SNN)', fontsize=11, fontweight='bold', color=imu_color)
+    ax1.set_xlabel('x (m)', fontsize=9); ax1.set_ylabel('y (m)', fontsize=9)
+    ax1.legend(fontsize=7, loc='upper right'); ax1.set_xlim(-0.5, ROOM_W + 0.5); ax1.set_ylim(-0.5, ROOM_H + 0.5)
+
+    # ── Panel 2: Open-loop SNN ───────────────
+    ax2 = fig.add_subplot(gs[0, 1])
+    _draw_room(ax2, results['obstacles'])
+    for i in range(n_show):
+        ax2.plot(results['x_gt'][i, ::4], results['y_gt'][i, ::4], 'o-', color=gt_colors[i], ms=3, lw=1.5, alpha=0.7)
+        ax2.plot(results['x_ol'][i, ::4], results['y_ol'][i, ::4], '^--', color=ol_color, ms=3, lw=2.0, alpha=0.85, label=f'OL SNN {i}' if i == 0 else None)
+        ax2.plot(results['x_gt'][i, 0], results['y_gt'][i, 0], 'D', color='lime', ms=10, zorder=10)
+        ax2.plot(results['x_ol'][i, 0], results['y_ol'][i, 0], 'X', color=ol_color, ms=10, zorder=10)
+
+    ax2.set_title('Panel 2: Open-Loop SNN\n(Pose-CANN, Globally Aligned)', fontsize=11, fontweight='bold', color=ol_color)
+    ax2.set_xlabel('x (m)', fontsize=9); ax2.set_ylabel('y (m)', fontsize=9)
+    ax2.legend(fontsize=7, loc='upper right'); ax2.set_xlim(-0.5, ROOM_W + 0.5); ax2.set_ylim(-0.5, ROOM_H + 0.5)
+
+    # ── Panel 3: Closed-loop SNN ────────────────────────
+    ax3 = fig.add_subplot(gs[0, 2])
+    _draw_room(ax3, results['obstacles'])
+    for i in range(n_show):
+        ax3.plot(results['x_gt'][i, ::4], results['y_gt'][i, ::4], 'o-', color=gt_colors[i], ms=3, lw=1.5, alpha=0.7)
+        ax3.plot(results['x_cl'][i, ::4], results['y_cl'][i, ::4], '^-', color=cl_color, ms=3, lw=2.0, alpha=0.85, label=f'CL SNN {i}' if i == 0 else None)
+
+    conf = results['loop_conf']
+    for i in range(n_show):
+        for t in range(T):
+            if conf[i, t] > 0.1:
+                ax3.plot(results['x_cl'][i, t], results['y_cl'][i, t], '.', color='#F39C12', ms=6, alpha=0.8, zorder=8)
+
+    ax3.set_title('Panel 3: Closed-Loop SNN SLAM v3\n(Globally Aligned, • = loop closure)', fontsize=11, fontweight='bold', color=cl_color)
+    ax3.set_xlabel('x (m)', fontsize=9); ax3.set_ylabel('y (m)', fontsize=9)
+    ax3.legend(fontsize=7, loc='upper right'); ax3.set_xlim(-0.5, ROOM_W + 0.5); ax3.set_ylim(-0.5, ROOM_H + 0.5)
+
+    # ── Panel 4: Event camera intensity images ───────────────────────────
+    ev_examples = results.get('ev_examples', [])
+    if ev_examples:
+        n_r, n_c = 2, 4
+        displayed = min(len(ev_examples), n_r * n_c)
+        ev_gs = gs[0, 3].subgridspec(n_r, n_c, wspace=0.15, hspace=0.35)
+        for idx in range(displayed):
+            r, c = idx // n_c, idx % n_c
+            ax_ev = fig.add_subplot(ev_gs[r, c])
+            ax_ev.imshow(ev_examples[idx][None, :], aspect='auto', cmap='gray_r', vmin=0, vmax=1.5, interpolation='nearest')
+            ax_ev.set_yticks([]); ax_ev.set_xticks([0, N_PIX//2, N_PIX])
+            ax_ev.set_xticklabels(['0', str(N_PIX//2), str(N_PIX)], fontsize=5)
+            ax_ev.tick_params(pad=1); ax_ev.set_title(f't={idx}', fontsize=6)
+        fig.text(0.895, 0.96, 'Panel 4: Event Camera\n(continuous intensity)', ha='center', va='top', fontsize=11, fontweight='bold', color='#333')
+    else:
+        ax4 = fig.add_subplot(gs[0, 3])
+        ax4.axis('off')
+
+    # ── Error comparison subplot (ATE) ─────────────────────────────────────────────
+    fig_err = plt.figure(figsize=(20, 5))
+    ax_err = fig_err.add_subplot(1, 1, 1)
+
+    mean_imu = results['pos_err_imu'].mean(axis=0)
+    mean_ol  = results['pos_err_ol'].mean(axis=0)
+    mean_cl  = results['pos_err_cl'].mean(axis=0)
+
+    ax_err.plot(t_arr, mean_imu, color=imu_color, lw=2.5, label=f'Raw IMU (mean={mean_imu.mean():.3f}m)', ls='--', alpha=0.8)
+    ax_err.plot(t_arr, mean_ol,  color=ol_color,  lw=2.5, label=f'Open-Loop ATE (mean={mean_ol.mean():.3f}m)', ls='-.', alpha=0.8)
+    ax_err.plot(t_arr, mean_cl,  color=cl_color,  lw=3.0, label=f'Closed-Loop ATE (mean={mean_cl.mean():.3f}m)', ls='-')
+
+    if ds < T:
+        ax_err.axvline(ds * DT, color='gray', ls=':', lw=1.5, alpha=0.7)
+        ax_err.text(ds * DT + 0.05, 0.95, 'Drift\nstarts', fontsize=8, color='gray', transform=ax_err.get_xaxis_transform(), verticalalignment='top')
+
+    ax_err.fill_between(t_arr, mean_imu, mean_cl, where=(mean_imu > mean_cl), color=cl_color, alpha=0.08, label='IMU→CL Improvement')
+
+    ax_err.set_title('Absolute Trajectory Error (ATE) over Time (meters, lower is better)', fontsize=12, fontweight='bold')
+    ax_err.set_xlabel('Time (s)', fontsize=10); ax_err.set_ylabel('Position Error (m)', fontsize=10)
+    ax_err.legend(fontsize=9, loc='upper left'); ax_err.grid(alpha=0.25, linestyle='--')
+    ax_err.set_xlim(0, T * DT); ax_err.set_ylim(bottom=0)
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        print(f"\n  💾 Saved trajectory figure: {save_path}")
+
+    err_path = save_path.replace('.png', '_error.png') if save_path else None
+    if err_path:
+        fig_err.savefig(err_path, dpi=150, bbox_inches='tight', facecolor='white')
+        print(f"  💾 Saved error figure: {err_path}")
+
+    return fig, fig_err
+
+
+def _draw_room(ax, obstacles):
+    ax.set_aspect('equal'); ax.set_xlim(-0.3, ROOM_W + 0.3); ax.set_ylim(-0.3, ROOM_H + 0.3)
+    ax.grid(alpha=0.2, linestyle='--')
+    ax.add_patch(Rectangle((0, 0), ROOM_W, ROOM_H, lw=2.5, edgecolor='#333', facecolor='#f8f8f5', alpha=0.5))
+    if obstacles is not None:
+        for o in obstacles:
+            ax.add_patch(Rectangle((float(o[0]), float(o[1])), float(o[2]-o[0]), float(o[3]-o[1]), facecolor='#888', edgecolor='#222', lw=1.0, alpha=0.85))
+    ax.set_xlabel('x (m)', fontsize=9); ax.set_ylabel('y (m)', fontsize=9)
+
+# ============================================================================
+#  🗺️  WORLD MAP VISUALIZATION
+# ============================================================================
+
+def visualize_world_map(results, save_path="snn_slam_world_map.png"):
+    print(f"\n 🗺️ Rendering Global Spiking Occupancy Map (Egocentric 'Latest Point' Pin) to {save_path}...")
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    # 1. Extract Latest Poses (The Anchors)
+    gt_x_end = results['x_gt'][0, -1]
+    gt_y_end = results['y_gt'][0, -1]
+    gt_th_end = results['th_gt'][0, -1]
+    
+    snn_x_end = results['x_cl_raw'][0, -1]
+    snn_y_end = results['y_cl_raw'][0, -1]
+    snn_th_end = results['th_cl_raw'][0, -1]
+    
+    # 2. Calculate the "Pin at Latest" Transform
+    # Rotate the SNN map so its final heading perfectly matches the GT final heading
+    delta_th = gt_th_end - snn_th_end
+    R_align = np.array([
+        [np.cos(delta_th), -np.sin(delta_th)],
+        [np.sin(delta_th),  np.cos(delta_th)]
+    ])
+    
+    # Translate the SNN map so its final X,Y perfectly matches the GT final X,Y
+    t_align = np.array([gt_x_end, gt_y_end]) - R_align @ np.array([snn_x_end, snn_y_end])
+    
+    # 3. Plot the Native SOG Image, Twisted by the Anchor Transform
+    sog_grid = results['sog_grid']
+    offset_m = 10.0
+    map_size_m = 30.0
+    extent = [-offset_m, map_size_m - offset_m, -offset_m, map_size_m - offset_m]
+    
+    # Force Matplotlib to rotate the SOG matrix using our calculated transform
+    trans_data = mtransforms.Affine2D().rotate(delta_th).translate(t_align[0], t_align[1]) + ax.transData
+    
+    ax.imshow(sog_grid.T, cmap='magma', origin='lower', 
+              extent=extent, vmin=-0.2, vmax=1.0, transform=trans_data)
+    
+    # 4. Transform the entire SNN history path
+    raw_snn_pts = np.stack([results['x_cl_raw'][0], results['y_cl_raw'][0]], axis=1)
+    pinned_snn_pts = (R_align @ raw_snn_pts.T).T + t_align
+    
+    # 5. Plot Ground Truth Room (Clean and straight!)
+    if results['obstacles'] is not None:
+        for o in results['obstacles']:
+            w, h = float(o[2]-o[0]), float(o[3]-o[1])
+            ax.add_patch(Rectangle((float(o[0]), float(o[1])), w, h, 
+                                   facecolor='none', edgecolor='cyan', lw=1.5, ls='--', alpha=0.5))
+                                   
+    ax.add_patch(Rectangle((0, 0), ROOM_W, ROOM_H, facecolor='none', edgecolor='cyan', lw=1.5, ls='--'))
+    
+    # Plot the Trajectories
+    ax.plot(results['x_gt'][0], results['y_gt'][0], color='#3498DB', lw=1.5, alpha=0.6, label='Ground Truth')
+    ax.plot(pinned_snn_pts[:, 0], pinned_snn_pts[:, 1], color='lime', lw=2.0, alpha=0.9, label='SNN (Pinned to Current)')
+    
+    # Plot a giant gold star to represent the "Now" Anchor
+    ax.plot(gt_x_end, gt_y_end, marker='*', color='gold', ms=18, markeredgecolor='red', label='Current Position (Anchor)')
+
+    ax.set_aspect('equal')
+    ax.set_xlim(-2, ROOM_W + 2); ax.set_ylim(-2, ROOM_H + 2)
+    ax.set_title('Phase 3: SOG (Egocentric "Latest Point" Pin)', fontsize=14, fontweight='bold')
+    ax.set_xlabel('x (meters)'); ax.set_ylabel('y (meters)')
+    ax.legend(loc='upper right')
+    
+    fig.savefig(save_path, dpi=200, bbox_inches='tight', facecolor='#222', edgecolor='none')
+    print(f"  Map saved successfully!")
+    plt.close(fig)

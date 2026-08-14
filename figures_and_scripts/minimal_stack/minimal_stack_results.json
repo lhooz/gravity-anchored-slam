@@ -1,0 +1,112 @@
+{
+ "n_seeds": 12,
+ "steps": 600,
+ "seeds": [
+  42,
+  153,
+  264,
+  375,
+  486,
+  597,
+  708,
+  819,
+  930,
+  1041,
+  1152,
+  1263
+ ],
+ "courses": {
+  "circuit": {
+   "full": {
+    "ate_cl_cm": 2.8235816234519806,
+    "ate_ol_cm": 5.574910600128238,
+    "closures": 51.916666666666664,
+    "precision": 1.0,
+    "keyframes": 83.58333333333333,
+    "bit_identical_to_full": true
+   },
+   "noplace": {
+    "ate_cl_cm": 2.8235816234519806,
+    "ate_ol_cm": 5.574910600128238,
+    "closures": 51.916666666666664,
+    "precision": 1.0,
+    "keyframes": 83.58333333333333,
+    "bit_identical_to_full": true
+   },
+   "noplace_nogrid": {
+    "ate_cl_cm": 2.810137980488451,
+    "ate_ol_cm": 5.569845850686752,
+    "closures": 51.916666666666664,
+    "precision": 1.0,
+    "keyframes": 83.58333333333333,
+    "bit_identical_to_full": false,
+    "delta_cm": -0.013443642963528865,
+    "delta_pct": -0.4761202173816845,
+    "delta_ci95": [
+     -0.021295079522711598,
+     -0.005255512255147359
+    ]
+   },
+   "noplace_nogrid_noring": {
+    "ate_cl_cm": 3.4628684931270617,
+    "ate_ol_cm": 5.569845850686752,
+    "closures": 50.666666666666664,
+    "precision": 1.0,
+    "keyframes": 82.41666666666667,
+    "bit_identical_to_full": false,
+    "delta_cm": 0.6392868696750812,
+    "delta_pct": 22.640991298615926,
+    "delta_ci95": [
+     0.0570854736722278,
+     1.3547093088955828
+    ]
+   }
+  },
+  "circuit_alias": {
+   "full": {
+    "ate_cl_cm": 2.938012774497229,
+    "ate_ol_cm": 5.599892167025859,
+    "closures": 51.5,
+    "precision": 1.0,
+    "keyframes": 83.58333333333333,
+    "bit_identical_to_full": true
+   },
+   "noplace": {
+    "ate_cl_cm": 2.938012774497229,
+    "ate_ol_cm": 5.599892167025859,
+    "closures": 51.5,
+    "precision": 1.0,
+    "keyframes": 83.58333333333333,
+    "bit_identical_to_full": true
+   },
+   "noplace_nogrid": {
+    "ate_cl_cm": 2.925384559809435,
+    "ate_ol_cm": 5.595393599646203,
+    "closures": 51.5,
+    "precision": 1.0,
+    "keyframes": 83.58333333333333,
+    "bit_identical_to_full": false,
+    "delta_cm": -0.012628214687793496,
+    "delta_pct": -0.42982163989925176,
+    "delta_ci95": [
+     -0.019631314932390016,
+     -0.0048898519290208504
+    ]
+   },
+   "noplace_nogrid_noring": {
+    "ate_cl_cm": 3.484322815260537,
+    "ate_ol_cm": 5.595393599646203,
+    "closures": 50.416666666666664,
+    "precision": 1.0,
+    "keyframes": 82.58333333333333,
+    "bit_identical_to_full": false,
+    "delta_cm": 0.5463100407633091,
+    "delta_pct": 18.594542729883027,
+    "delta_ci95": [
+     -0.08836432574513217,
+     1.3727171058554137
+    ]
+   }
+  }
+ }
+}

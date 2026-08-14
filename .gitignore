@@ -1,0 +1,32 @@
+# caches / OS junk
+__pycache__/
+*.pyc
+.DS_Store
+
+# exploratory study not part of the paper (kept in the private dev tree)
+figures_and_scripts/layer2_study/
+
+# local environments
+.venv/
+venv/
+
+# pre-rebuild debug renders (regenerate from current config if needed)
+neuro-symbolic-slam/results/*.gif
+
+# internal dev docs
+neuro-symbolic-slam/PROJECT_SUMMARY.md
+
+# dev backup snapshots
+*.k8
+*.pre_*
+*.preB2
+*.pre_hash
+*.bak
+*.orig
+
+# component-audit harnesses (exploratory; not on any figure path — archived in the private dev tree)
+validation/
+
+# run logs and one-off rerun helpers
+*.log
+figures_and_scripts/minimal_stack/rerun34.sh
