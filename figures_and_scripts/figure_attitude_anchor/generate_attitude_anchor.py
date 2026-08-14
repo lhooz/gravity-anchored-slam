@@ -114,12 +114,12 @@ axB.set_ylim(0, max(8.0, float(un.max()) * 1.2))
 # orange curve so it no longer buries the drift-onset knee. (\rightarrow via mathtext: the fallback
 # font has no U+2192 glyph, unlike the degree/approx signs.)
 axB.annotate('path-integrates\nvibration $\\rightarrow$ drifts',
-             xy=(amp[-4], un[-4]), xytext=(0.975, 0.72), textcoords='axes fraction',
-             fontsize=7.2, color=figstyle.C_IMU, ha='right', va='top',
+             xy=(amp[-4], un[-4]), xytext=(0.66, 0.97), textcoords='axes fraction',
+             fontsize=7.2, color=figstyle.C_IMU, ha='left', va='top',
              arrowprops=dict(arrowstyle='->', color=figstyle.C_IMU, lw=0.8,
                              connectionstyle='arc3,rad=0.25'))
 axB.annotate('anchored ring tracks the raw CF',
-             xy=(amp[-2], an[-2]), xytext=(0.40, 0.10), textcoords='axes fraction',
+             xy=(amp[3], an[3]), xytext=(0.06, 0.10), textcoords='axes fraction',
              fontsize=7.2, color=figstyle.C_ANCH, ha='left',
              arrowprops=dict(arrowstyle='->', color=figstyle.C_ANCH, lw=0.8))
 axB.legend(loc='upper left', bbox_to_anchor=(0.02, 1.0), fontsize=7.4, handlelength=1.4,
